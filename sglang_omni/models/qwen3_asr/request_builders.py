@@ -15,10 +15,8 @@ into those positions. So request_builder must:
 from __future__ import annotations
 
 import hashlib
-import io
 import logging
 import time
-import wave
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -32,6 +30,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+from sglang_omni.preprocessing.audio import parse_wav_bytes, read_wav_bytes
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
@@ -70,51 +69,14 @@ def _audio_source_from_payload(payload: StagePayload) -> Any:
     return inputs
 
 
-def _load_pcm_wav(source: Any) -> tuple[np.ndarray, int]:
-    """Load uncompressed int16 PCM WAV. Raises ValueError for unsupported inputs."""
-    if isinstance(source, bytes):
-        wav_source: Any = io.BytesIO(source)
-    elif isinstance(source, str):
-        wav_source = source
-    else:
-        raise ValueError(f"Unsupported audio input type: {type(source).__name__}")
-
-    try:
-        with wave.open(wav_source, "rb") as wav_file:
-            comp_type = wav_file.getcomptype()
-            if comp_type != "NONE":
-                raise ValueError(f"Unsupported WAV compression: {comp_type}")
-            channels = wav_file.getnchannels()
-            sample_width = wav_file.getsampwidth()
-            sample_rate = wav_file.getframerate()
-            frame_count = wav_file.getnframes()
-            if channels < 1 or sample_rate <= 0 or frame_count <= 0:
-                raise ValueError(
-                    f"Invalid WAV header: channels={channels} sample_rate={sample_rate} frames={frame_count}"
-                )
-            if sample_width != 2:
-                raise ValueError(
-                    f"Unsupported WAV sample width {sample_width}, only int16 / 2-byte supported"
-                )
-            raw = wav_file.readframes(frame_count)
-    except (EOFError, OSError, wave.Error) as exc:
-        raise ValueError(f"Failed to read WAV: {exc}") from exc
-
-    expected_bytes = frame_count * channels * sample_width
-    if len(raw) != expected_bytes:
-        raise ValueError(
-            f"Truncated WAV: expected {expected_bytes} bytes, got {len(raw)}"
-        )
-
-    audio = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-    if channels > 1:
-        audio = audio.reshape(frame_count, channels).T
-    else:
-        audio = audio.reshape(1, frame_count)
-    return audio, sample_rate
-
-
 def load_audio(source: Any) -> np.ndarray:
+    """Decode a WAV input to mono float32 @ 16 kHz.
+
+    Decoding reuses the model-agnostic ``parse_wav_bytes`` helper, which already
+    downmixes to mono and supports PCM 8/16/32-bit and IEEE float 32/64. Only the
+    16 kHz resampling stays on ``torchaudio`` (windowed-sinc) so that ASR quality
+    is unchanged for non-16k inputs.
+    """
     import torchaudio
 
     if isinstance(source, memoryview):
@@ -122,12 +84,16 @@ def load_audio(source: Any) -> np.ndarray:
     if isinstance(source, bytearray):
         source = bytes(source)
 
-    audio_np, sample_rate = _load_pcm_wav(source)
-    audio = torch.from_numpy(audio_np)
+    if isinstance(source, bytes):
+        audio_np, sample_rate = parse_wav_bytes(source)
+    elif isinstance(source, str):
+        audio_np, sample_rate = read_wav_bytes(source)
+    else:
+        raise ValueError(f"Unsupported audio input type: {type(source).__name__}")
 
-    if audio.ndim == 2 and audio.shape[0] > 1:
-        audio = audio.mean(dim=0, keepdim=True)
-    audio = audio.squeeze(0).to(torch.float32)
+    if not audio_np.flags.writeable:
+        audio_np = audio_np.copy()
+    audio = torch.from_numpy(audio_np).to(torch.float32)
     if sample_rate != _SAMPLE_RATE:
         audio = torchaudio.functional.resample(audio, sample_rate, _SAMPLE_RATE)
     return audio.cpu().numpy()

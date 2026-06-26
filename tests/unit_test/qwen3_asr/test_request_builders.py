@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import struct
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,6 @@ from sglang_omni.models.qwen3_asr.audio_lengths import (
 from sglang_omni.models.qwen3_asr.configuration_qwen3_asr import Qwen3ASRProcessor
 from sglang_omni.models.qwen3_asr.request_builders import (
     Qwen3ASRRequestData,
-    _load_pcm_wav,
     load_audio,
     make_qwen3_asr_scheduler_adapters,
 )
@@ -56,6 +56,32 @@ def _wav_bytes_uint8(audio: np.ndarray, *, sample_rate: int) -> bytes:
     return buffer.getvalue()
 
 
+def _wav_bytes_float32(audio: np.ndarray, *, sample_rate: int) -> bytes:
+    """Build an IEEE-float (fmt tag 3) WAV, which the stdlib ``wave`` cannot write."""
+    if audio.ndim == 1:
+        pcm = audio[:, None]
+    else:
+        pcm = audio
+    channels = pcm.shape[1]
+    data = pcm.astype("<f4").tobytes()
+    bytes_per_sample = 4
+    block_align = channels * bytes_per_sample
+    byte_rate = sample_rate * block_align
+    fmt_chunk = struct.pack(
+        "<HHIIHH", 3, channels, sample_rate, byte_rate, block_align, 8 * bytes_per_sample
+    )
+    riff = (
+        b"WAVE"
+        + b"fmt "
+        + struct.pack("<I", len(fmt_chunk))
+        + fmt_chunk
+        + b"data"
+        + struct.pack("<I", len(data))
+        + data
+    )
+    return b"RIFF" + struct.pack("<I", len(riff)) + riff
+
+
 def test_qwen3_asr_fast_pcm_wav_loads_mono_16k_bytes() -> None:
     audio = np.array([0.0, 0.5, -0.5, 0.25], dtype=np.float32)
     loaded = load_audio(_wav_bytes(audio, sample_rate=16000))
@@ -75,38 +101,45 @@ def test_qwen3_asr_fast_pcm_wav_loads_path(tmp_path: Path) -> None:
     np.testing.assert_allclose(loaded, expected, atol=1e-6)
 
 
-def test_qwen3_asr_pcm_wav_loads_stereo_without_resample() -> None:
+def test_qwen3_asr_pcm_wav_downmixes_stereo_without_resample() -> None:
+    # frames x channels; channels are NOT mirror images so the mono mix is non-trivial.
     audio = np.array(
         [
-            [0.25, -0.25],
-            [0.5, -0.5],
+            [0.2, -0.4],
+            [0.5, 0.1],
         ],
         dtype=np.float32,
     )
-    loaded_channels_first, sample_rate = _load_pcm_wav(
-        _wav_bytes(audio, sample_rate=16000)
-    )
+    loaded = load_audio(_wav_bytes(audio, sample_rate=16000))
 
-    assert sample_rate == 16000
-    expected = np.array(
-        [
-            [8191 / 32768.0, 16383 / 32768.0],
-            [-8191 / 32768.0, -16383 / 32768.0],
-        ],
-        dtype=np.float32,
-    )
-    np.testing.assert_allclose(loaded_channels_first, expected, atol=1e-6)
+    pcm16 = np.clip(audio * 32767.0, -32768, 32767).astype("<i2")
+    expected = (pcm16.astype(np.float32) / 32768.0).mean(axis=1)
+    assert loaded.ndim == 1
+    np.testing.assert_allclose(loaded, expected, atol=1e-6)
 
 
 def test_qwen3_asr_pcm_wav_rejects_malformed_bytes() -> None:
-    with pytest.raises(ValueError, match="Failed to read WAV"):
-        _load_pcm_wav(b"not a wav")
+    with pytest.raises(ValueError, match="WAV"):
+        load_audio(b"not a wav")
 
 
-def test_qwen3_asr_pcm_wav_rejects_unsupported_sample_width() -> None:
+def test_qwen3_asr_wav_loads_uint8_pcm() -> None:
     audio = np.array([0.0, 0.5, -0.5, 0.25], dtype=np.float32)
-    with pytest.raises(ValueError, match="sample width"):
-        _load_pcm_wav(_wav_bytes_uint8(audio, sample_rate=16000))
+    loaded = load_audio(_wav_bytes_uint8(audio, sample_rate=16000))
+
+    # 8-bit PCM round-trips coarsely; just assert it decodes into mono float32.
+    assert loaded.ndim == 1
+    assert loaded.dtype == np.float32
+    assert loaded.shape[0] == audio.shape[0]
+    np.testing.assert_allclose(loaded, audio, atol=1e-2)
+
+
+def test_qwen3_asr_wav_loads_float32() -> None:
+    audio = np.array([0.0, 0.5, -0.5, 0.25], dtype=np.float32)
+    loaded = load_audio(_wav_bytes_float32(audio, sample_rate=16000))
+
+    assert loaded.dtype == np.float32
+    np.testing.assert_allclose(loaded, audio, atol=1e-6)
 
 
 @pytest.mark.parametrize("sample_rate", [16000, 44100, 48000])
@@ -122,10 +155,12 @@ def test_qwen3_asr_pcm_wav_loads_common_formats(
         audio = rng.uniform(-0.8, 0.8, size=(n_frames, channels)).astype(np.float32)
 
     wav = _wav_bytes(audio, sample_rate=sample_rate)
-    loaded_audio, loaded_sr = _load_pcm_wav(wav)
+    loaded = load_audio(wav)
 
-    assert loaded_sr == sample_rate
-    assert loaded_audio.shape == (channels, n_frames)
+    assert loaded.ndim == 1
+    assert loaded.dtype == np.float32
+    if sample_rate == 16000:
+        assert loaded.shape[0] == n_frames
 
 
 def test_qwen3_asr_pcm_wav_matches_torchaudio(tmp_path: Path) -> None:

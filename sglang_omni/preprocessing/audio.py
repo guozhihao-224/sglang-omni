@@ -16,7 +16,7 @@ import torch
 from .base import MediaIO, _is_url
 
 
-def _decode_audio_bytes_av(data: bytes) -> tuple[np.ndarray, int]:
+def decode_audio_bytes_av(data: bytes) -> tuple[np.ndarray, int]:
     """Decode audio bytes using PyAV (supports WebM/Opus, MP3, OGG, FLAC, etc.)."""
     import io
 
@@ -52,7 +52,7 @@ def _decode_audio_bytes_av(data: bytes) -> tuple[np.ndarray, int]:
     return audio, int(sample_rate)
 
 
-def _parse_wav_bytes(data: bytes, source: str = "bytes") -> tuple[np.ndarray, int]:
+def parse_wav_bytes(data: bytes, source: str = "bytes") -> tuple[np.ndarray, int]:
     """Parse PCM/IEEE-float WAV from bytes without external deps."""
     if len(data) < 12:
         raise ValueError(f"Invalid WAV header: {source}")
@@ -124,11 +124,11 @@ def _parse_wav_bytes(data: bytes, source: str = "bytes") -> tuple[np.ndarray, in
     return audio.astype(np.float32, copy=False), int(sample_rate)
 
 
-def _read_wav_bytes(path: str) -> tuple[np.ndarray, int]:
+def read_wav_bytes(path: str) -> tuple[np.ndarray, int]:
     """Read PCM/IEEE-float WAV from file path without external deps."""
     with open(path, "rb") as f:
         data = f.read()
-    return _parse_wav_bytes(data, source=path)
+    return parse_wav_bytes(data, source=path)
 
 
 def _resample_linear(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -147,9 +147,9 @@ def load_audio_path(path: str | Path, *, target_sr: int = 16000) -> np.ndarray:
     with open(path, "rb") as f:
         data = f.read()
     try:
-        audio, sr = _parse_wav_bytes(data, source=str(path))
+        audio, sr = parse_wav_bytes(data, source=str(path))
     except ValueError:
-        audio, sr = _decode_audio_bytes_av(data)
+        audio, sr = decode_audio_bytes_av(data)
     return _resample_linear(audio, sr, target_sr)
 
 
@@ -193,9 +193,9 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
     def load_bytes(self, data: bytes) -> tuple[npt.NDArray, float]:
         """Load audio from raw bytes (WAV, WebM/Opus, MP3, OGG, FLAC, etc.)."""
         try:
-            audio, sr = _parse_wav_bytes(data, source="bytes")
+            audio, sr = parse_wav_bytes(data, source="bytes")
         except ValueError:
-            audio, sr = _decode_audio_bytes_av(data)
+            audio, sr = decode_audio_bytes_av(data)
         resampled = _resample_linear(audio, sr, self.target_sr)
         return resampled, float(self.target_sr)
 
@@ -212,9 +212,9 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
         with open(filepath, "rb") as f:
             data = f.read()
         try:
-            audio, sr = _parse_wav_bytes(data, source=str(filepath))
+            audio, sr = parse_wav_bytes(data, source=str(filepath))
         except ValueError:
-            audio, sr = _decode_audio_bytes_av(data)
+            audio, sr = decode_audio_bytes_av(data)
         resampled = _resample_linear(audio, sr, self.target_sr)
         return resampled, float(self.target_sr)
 
