@@ -226,6 +226,26 @@ class MiMoV2ASRForCausalLM(nn.Module):
 
         return self.project_grouped_audio_embeds(self.embed_grouped_audio_codes(codes))
 
+    def get_audio_feature(self, items: list[Any]) -> torch.Tensor:
+        """Encode multimodal audio items into hidden-size embeddings.
+
+        ``request_builders`` stores MiMo RVQ codes under
+        ``item.model_specific_data["audio_codes"]`` and also mirrors them in
+        ``item.feature``.  Prefer model-specific data so later metadata can
+        evolve without changing the tensor field contract.
+        """
+
+        if not items:
+            raise ValueError("MiMo-ASR get_audio_feature requires at least one item")
+        encoded_items: list[torch.Tensor] = []
+        for item in items:
+            model_specific_data = getattr(item, "model_specific_data", None) or {}
+            codes = model_specific_data.get("audio_codes", getattr(item, "feature", None))
+            if codes is None:
+                raise ValueError("MiMo-ASR audio item is missing audio_codes/feature")
+            encoded_items.append(self.encode_audio_codes_to_hidden(codes))
+        return torch.cat(encoded_items, dim=0)
+
     def pad_input_ids(self, input_ids: list[int], mm_inputs: Any):
         raise NotImplementedError("MiMo-ASR pad_input_ids is not implemented yet")
 

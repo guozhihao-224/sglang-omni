@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
@@ -208,3 +210,75 @@ def test_mimo_model_project_grouped_audio_embeds_validates_shape() -> None:
         assert "speech group dimension" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("bad group dimension should fail")
+
+
+def test_mimo_model_get_audio_feature_uses_model_specific_audio_codes() -> None:
+    config = _tiny_config(hidden_size=1)
+    model = MiMoV2ASRForCausalLM(config)
+    with torch.no_grad():
+        for embedding in model.speech_embeddings:
+            embedding.weight.fill_(1.0)
+        model.speech_group_downcast.weight.fill_(1.0)
+        model.speech_group_downcast.bias.zero_()
+    item = SimpleNamespace(
+        feature=torch.tensor([[4, 5], [4, 5]]),
+        model_specific_data={"audio_codes": torch.tensor([[0, 0], [1, 1]])},
+    )
+
+    hidden = model.get_audio_feature([item])
+
+    assert torch.equal(hidden, torch.tensor([[12.0]]))
+
+
+def test_mimo_model_get_audio_feature_falls_back_to_feature() -> None:
+    config = _tiny_config(hidden_size=1)
+    model = MiMoV2ASRForCausalLM(config)
+    with torch.no_grad():
+        for embedding in model.speech_embeddings:
+            embedding.weight.fill_(1.0)
+        model.speech_group_downcast.weight.fill_(1.0)
+        model.speech_group_downcast.bias.zero_()
+    item = SimpleNamespace(
+        feature=torch.tensor([[0, 0], [1, 1]]),
+        model_specific_data={},
+    )
+
+    hidden = model.get_audio_feature([item])
+
+    assert torch.equal(hidden, torch.tensor([[12.0]]))
+
+
+def test_mimo_model_get_audio_feature_concats_multiple_items() -> None:
+    config = _tiny_config(hidden_size=1)
+    model = MiMoV2ASRForCausalLM(config)
+    with torch.no_grad():
+        for embedding in model.speech_embeddings:
+            embedding.weight.fill_(1.0)
+        model.speech_group_downcast.weight.fill_(1.0)
+        model.speech_group_downcast.bias.zero_()
+    items = [
+        SimpleNamespace(feature=torch.tensor([[0, 0], [1, 1]]), model_specific_data={}),
+        SimpleNamespace(feature=torch.tensor([[2, 2], [3, 3]]), model_specific_data={}),
+    ]
+
+    hidden = model.get_audio_feature(items)
+
+    assert torch.equal(hidden, torch.tensor([[12.0], [12.0]]))
+
+
+def test_mimo_model_get_audio_feature_validates_items() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+
+    try:
+        model.get_audio_feature([])
+    except ValueError as exc:
+        assert "at least one item" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("empty item list should fail")
+
+    try:
+        model.get_audio_feature([SimpleNamespace(model_specific_data={})])
+    except ValueError as exc:
+        assert "missing audio_codes" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("missing audio codes should fail")
