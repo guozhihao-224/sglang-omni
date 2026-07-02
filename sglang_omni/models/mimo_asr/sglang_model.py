@@ -12,8 +12,23 @@ from typing import Any, Iterable
 import torch
 import torch.nn as nn
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix
 
 from .configuration_mimo_asr import MiMoV2ASRConfig
+
+_LANGUAGE_MODEL_PREFIX = "model."
+_SUPPORTED_DIRECT_PREFIXES = (
+    "lm_head.",
+    "speech_embeddings.",
+    "speech_group_downcast.",
+)
+_PENDING_MIMO_PREFIXES = (
+    "input_local_transformer.",
+    "hidden_states_downcast.",
+    "local_transformer.",
+    "local_transformer_lm_heads.",
+)
 
 
 def validate_mimo_speech_config(config: MiMoV2ASRConfig) -> None:
@@ -139,6 +154,7 @@ class MiMoV2ASRForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.prefix = prefix
+        self.language_model = None
         self.audio_channels = int(config.audio_channels)
         self.group_size = int(config.group_size)
         self.speech_vocab_sizes = list(config.speech_vocab_sizes)
@@ -162,6 +178,28 @@ class MiMoV2ASRForCausalLM(nn.Module):
         self.speech_group_downcast = nn.Linear(
             self.group_size * input_local_dim,
             hidden_size,
+        )
+
+    def build_language_model(self) -> nn.Module:
+        """Build and attach the SGLang Qwen2 text backbone.
+
+        Kept explicit for now so helper/unit tests can instantiate this class
+        without constructing a large Qwen2 model.  The full native forward path
+        should call this during model initialization once weight loading and
+        prefill/decode integration are complete.
+        """
+
+        if self.language_model is None:
+            self.language_model = self._build_language_model()
+        return self.language_model
+
+    def _build_language_model(self) -> nn.Module:
+        from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+
+        return Qwen2ForCausalLM(
+            self.config,
+            self.quant_config,
+            prefix=add_prefix("model", self.prefix),
         )
 
     def embed_grouped_audio_codes(self, codes: Any) -> torch.Tensor:
@@ -420,7 +458,63 @@ class MiMoV2ASRForCausalLM(nn.Module):
         raise NotImplementedError("MiMo-ASR forward/decode is not implemented yet")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        raise NotImplementedError("MiMo-ASR weight loading is not implemented yet")
+        """Load currently implemented MiMo-ASR weights.
+
+        This intentionally supports only the modules already present in this
+        skeleton.  Qwen2 backbone and local-transformer weights are routed and
+        guarded so missing implementation fails loudly instead of silently
+        dropping required checkpoint tensors.
+        """
+
+        pending_language_weights: list[tuple[str, torch.Tensor]] = []
+        pending_mimo_prefixes: set[str] = set()
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        for name, loaded_weight in weights:
+            route = route_mimo_weight_name(name)
+            if route == "language_model":
+                pending_language_weights.append((name.removeprefix(_LANGUAGE_MODEL_PREFIX), loaded_weight))
+                continue
+            if route == "pending_mimo":
+                pending_mimo_prefixes.add(name.split(".", 1)[0])
+                continue
+            if route == "unknown":
+                continue
+            if name not in params_dict:
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded.add(name)
+
+        if pending_language_weights:
+            if self.language_model is None:
+                raise NotImplementedError(
+                    "MiMo-ASR Qwen2 language_model is not built yet; cannot load model.* weights"
+                )
+            self.language_model.load_weights(pending_language_weights)
+            loaded.update(f"{_LANGUAGE_MODEL_PREFIX}{name}" for name, _ in pending_language_weights)
+
+        if pending_mimo_prefixes:
+            raise NotImplementedError(
+                "MiMo-ASR local transformer weight loading is not implemented yet for prefixes: "
+                + ", ".join(sorted(pending_mimo_prefixes))
+            )
+
+        return loaded
+
+
+def route_mimo_weight_name(name: str) -> str:
+    """Classify MiMo checkpoint weights for staged loading."""
+
+    if name.startswith(_LANGUAGE_MODEL_PREFIX):
+        return "language_model"
+    if name.startswith(_SUPPORTED_DIRECT_PREFIXES):
+        return "direct"
+    if name.startswith(_PENDING_MIMO_PREFIXES):
+        return "pending_mimo"
+    return "unknown"
 
 
 EntryClass = MiMoV2ASRForCausalLM
@@ -431,5 +525,6 @@ __all__ = [
     "group_mimo_audio_codes",
     "normalize_mimo_audio_codes",
     "pad_mimo_audio_codes_to_group",
+    "route_mimo_weight_name",
     "validate_mimo_speech_config",
 ]

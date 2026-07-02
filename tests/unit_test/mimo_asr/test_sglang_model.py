@@ -12,6 +12,7 @@ from sglang_omni.models.mimo_asr.sglang_model import (
     group_mimo_audio_codes,
     normalize_mimo_audio_codes,
     pad_mimo_audio_codes_to_group,
+    route_mimo_weight_name,
     validate_mimo_speech_config,
 )
 
@@ -541,3 +542,102 @@ def test_mimo_model_embed_input_ids_validates_embedding_shape() -> None:
         assert "token_embedding" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("bad token embedding shape should fail")
+
+
+def test_mimo_model_build_language_model_is_lazy_and_cached(monkeypatch) -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+    built = object()
+    calls = []
+    monkeypatch.setattr(
+        model,
+        "_build_language_model",
+        lambda: (calls.append("build") or built),
+    )
+
+    assert model.language_model is None
+    assert model.build_language_model() is built
+    assert model.build_language_model() is built
+    assert calls == ["build"]
+
+
+def test_route_mimo_weight_name_classifies_checkpoint_prefixes() -> None:
+    assert route_mimo_weight_name("model.layers.0.self_attn.q_proj.weight") == "language_model"
+    assert route_mimo_weight_name("lm_head.weight") == "direct"
+    assert route_mimo_weight_name("speech_embeddings.0.weight") == "direct"
+    assert route_mimo_weight_name("speech_group_downcast.weight") == "direct"
+    assert route_mimo_weight_name("input_local_transformer.layers.0.weight") == "pending_mimo"
+    assert route_mimo_weight_name("hidden_states_downcast.weight") == "pending_mimo"
+    assert route_mimo_weight_name("local_transformer.layers.0.weight") == "pending_mimo"
+    assert route_mimo_weight_name("local_transformer_lm_heads.0.weight") == "pending_mimo"
+    assert route_mimo_weight_name("unused.weight") == "unknown"
+
+
+def test_mimo_model_load_weights_loads_supported_direct_modules() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=2))
+    weights = [
+        ("speech_embeddings.0.weight", torch.full_like(model.speech_embeddings[0].weight, 1.5)),
+        ("speech_embeddings.1.weight", torch.full_like(model.speech_embeddings[1].weight, 2.5)),
+        (
+            "speech_group_downcast.weight",
+            torch.full_like(model.speech_group_downcast.weight, 3.5),
+        ),
+        (
+            "speech_group_downcast.bias",
+            torch.full_like(model.speech_group_downcast.bias, 4.5),
+        ),
+        ("unknown.weight", torch.tensor([1.0])),
+    ]
+
+    loaded = model.load_weights(weights)
+
+    assert loaded == {
+        "speech_embeddings.0.weight",
+        "speech_embeddings.1.weight",
+        "speech_group_downcast.weight",
+        "speech_group_downcast.bias",
+    }
+    assert torch.equal(model.speech_embeddings[0].weight, torch.full_like(model.speech_embeddings[0].weight, 1.5))
+    assert torch.equal(model.speech_embeddings[1].weight, torch.full_like(model.speech_embeddings[1].weight, 2.5))
+    assert torch.equal(model.speech_group_downcast.weight, torch.full_like(model.speech_group_downcast.weight, 3.5))
+    assert torch.equal(model.speech_group_downcast.bias, torch.full_like(model.speech_group_downcast.bias, 4.5))
+
+
+def test_mimo_model_load_weights_routes_language_model_when_built() -> None:
+    class _FakeLanguageModel:
+        def __init__(self) -> None:
+            self.weights = None
+
+        def load_weights(self, weights):
+            self.weights = list(weights)
+
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+    language_model = _FakeLanguageModel()
+    model.language_model = language_model
+    tensor = torch.tensor([1.0])
+
+    loaded = model.load_weights([("model.layers.0.weight", tensor)])
+
+    assert language_model.weights == [("layers.0.weight", tensor)]
+    assert loaded == {"model.layers.0.weight"}
+
+
+def test_mimo_model_load_weights_rejects_language_weights_before_backbone() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+
+    try:
+        model.load_weights([("model.layers.0.weight", torch.tensor([1.0]))])
+    except NotImplementedError as exc:
+        assert "language_model" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("language weights should fail before backbone is built")
+
+
+def test_mimo_model_load_weights_rejects_pending_local_transformer_prefixes() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+
+    try:
+        model.load_weights([("local_transformer.layers.0.weight", torch.tensor([1.0]))])
+    except NotImplementedError as exc:
+        assert "local_transformer" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("pending local transformer weights should fail")
