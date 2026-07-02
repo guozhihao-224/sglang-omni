@@ -55,12 +55,12 @@ class MiMoAudioTokenizerAdapter:
 
         import importlib
 
-        candidates = (
+        worker_candidates = (
             "mimo_audio.mimo_audio_code2wav",
             "vllm_omni.model_executor.models.mimo_audio.mimo_audio_code2wav",
         )
         last_error: BaseException | None = None
-        for module_name in candidates:
+        for module_name in worker_candidates:
             try:
                 module = importlib.import_module(module_name)
                 get_tokenizer_worker = getattr(module, "get_tokenizer_worker")
@@ -72,6 +72,17 @@ class MiMoAudioTokenizerAdapter:
                 return self._backend
             except Exception as exc:  # pragma: no cover - environment dependent
                 last_error = exc
+        try:
+            module = importlib.import_module("mimo_audio_tokenizer")
+            tokenizer_cls = getattr(module, "MiMoAudioTokenizer")
+            self._backend = _OfficialMiMoAudioTokenizerBackend(
+                tokenizer_cls=tokenizer_cls,
+                audio_tokenizer_path=self.audio_tokenizer_path,
+                device=self.device,
+            )
+            return self._backend
+        except Exception as exc:  # pragma: no cover - environment dependent
+            last_error = exc
         raise RuntimeError(
             "Unable to load MiMo audio tokenizer backend. Install the official "
             "MiMo audio tokenizer package or vLLM-Omni, and set "
@@ -137,6 +148,92 @@ class MiMoAudioTokenizerAdapter:
         pad_frames = self.group_size - remainder
         tail = codes[-1:].expand(pad_frames, -1)
         return torch.cat([codes, tail], dim=0).contiguous()
+
+
+class _OfficialMiMoAudioTokenizerBackend:
+    """Backend wrapper for XiaomiMiMo's official MiMoAudioTokenizer."""
+
+    def __init__(
+        self,
+        *,
+        tokenizer_cls: Any,
+        audio_tokenizer_path: str,
+        device: str,
+    ) -> None:
+        self.device = torch.device(device)
+        self.tokenizer = tokenizer_cls.from_pretrained(audio_tokenizer_path)
+        self.tokenizer.eval().bfloat16().to(self.device)
+        self.config = self.tokenizer.config
+        self._mel_transform = None
+
+    def encode(self, *, audio: tuple[torch.Tensor, int]) -> torch.Tensor:
+        waveform, sample_rate = audio
+        waveform = waveform.to(device=self.device, dtype=torch.float32)
+        if int(sample_rate) != int(self.config.sampling_rate):
+            try:
+                import torchaudio
+            except ImportError as exc:  # pragma: no cover - dependency guard
+                raise RuntimeError(
+                    "torchaudio is required to resample MiMo-ASR audio"
+                ) from exc
+            waveform = torchaudio.functional.resample(
+                waveform,
+                int(sample_rate),
+                int(self.config.sampling_rate),
+            )
+        return self._encode_waveform(waveform).transpose(0, 1).detach().cpu()
+
+    def _encode_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
+        target_sr = int(self.config.sampling_rate)
+        chunk_samples = 30 * target_sr
+        n_fft = int(self.config.nfft)
+        total_samples = int(waveform.shape[-1])
+        code_parts: list[torch.Tensor] = []
+        start = 0
+        while start < total_samples:
+            end = min(start + chunk_samples, total_samples)
+            if 0 < total_samples - end < n_fft:
+                end = total_samples
+            chunk = waveform[start:end]
+            if int(chunk.shape[-1]) < n_fft:
+                chunk = torch.nn.functional.pad(chunk, (0, n_fft - int(chunk.shape[-1])))
+            mel = self._wav_to_mel(chunk).transpose(0, 1)
+            code_parts.append(self._encode_features(mel, torch.tensor([mel.size(0)])))
+            start = end
+        if not code_parts:
+            raise ValueError("MiMo audio tokenizer received empty waveform")
+        return torch.cat(code_parts, dim=-1)
+
+    def _wav_to_mel(self, waveform: torch.Tensor) -> torch.Tensor:
+        if self._mel_transform is None:
+            from torchaudio.transforms import MelSpectrogram
+
+            self._mel_transform = MelSpectrogram(
+                sample_rate=int(self.config.sampling_rate),
+                n_fft=int(self.config.nfft),
+                hop_length=int(self.config.hop_length),
+                win_length=int(self.config.window_size),
+                f_min=float(self.config.fmin),
+                f_max=float(self.config.fmax),
+                n_mels=int(self.config.n_mels),
+                power=1.0,
+                center=True,
+            ).to(self.device)
+        spec = self._mel_transform(waveform[None, :])
+        return torch.log(torch.clip(spec, min=1e-7)).squeeze()
+
+    def _encode_features(
+        self,
+        input_features: torch.Tensor,
+        input_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            codes, _ = self.tokenizer.encoder.encode(
+                input_features=input_features.to(self.device),
+                input_lens=input_lens.to(self.device),
+                return_codes_only=True,
+            )
+        return codes
 
 
 def _as_float_tensor(audio: Any) -> torch.Tensor:

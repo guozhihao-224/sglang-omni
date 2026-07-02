@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 
@@ -106,3 +108,41 @@ def test_mimo_audio_tokenizer_rejects_bad_group_size() -> None:
         assert "group_size" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("bad group size should fail")
+
+
+def test_mimo_audio_tokenizer_loads_official_backend(monkeypatch) -> None:
+    class _FakeTokenizer:
+        config = SimpleNamespace(
+            sampling_rate=24000,
+            nfft=400,
+            hop_length=160,
+            window_size=400,
+            fmin=0,
+            fmax=8000,
+            n_mels=128,
+        )
+
+        @classmethod
+        def from_pretrained(cls, path):
+            assert path == "tok"
+            return cls()
+
+        def eval(self):
+            return self
+
+        def bfloat16(self):
+            return self
+
+        def to(self, device):
+            return self
+
+    def _fake_import_module(name):
+        if name == "mimo_audio_tokenizer":
+            return SimpleNamespace(MiMoAudioTokenizer=_FakeTokenizer)
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr("importlib.import_module", _fake_import_module)
+
+    backend = MiMoAudioTokenizerAdapter("tok", device="cpu")._load_backend()
+
+    assert backend.tokenizer.__class__ is _FakeTokenizer
