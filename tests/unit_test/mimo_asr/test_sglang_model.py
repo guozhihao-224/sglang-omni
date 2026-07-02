@@ -9,6 +9,7 @@ import torch
 from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
 from sglang_omni.models.mimo_asr.sglang_model import (
     MiMoInputLocalTransformer,
+    MiMoLocalTransformer,
     MiMoV2ASRForCausalLM,
     group_mimo_audio_codes,
     normalize_mimo_audio_codes,
@@ -131,6 +132,11 @@ def test_mimo_sglang_model_initializes_speech_embedding_modules() -> None:
     assert isinstance(model.input_local_transformer, MiMoInputLocalTransformer)
     assert model.hidden_states_downcast.in_features == 7
     assert model.hidden_states_downcast.out_features == 3
+    assert isinstance(model.local_transformer, MiMoLocalTransformer)
+    assert len(model.local_transformer_lm_heads) == 2
+    assert model.local_transformer_lm_heads[0].in_features == 3
+    assert model.local_transformer_lm_heads[0].out_features == 5
+    assert model.local_transformer_lm_heads[1].out_features == 6
 
 
 def test_mimo_model_embeds_grouped_audio_codes_with_zeroemb_mask() -> None:
@@ -251,6 +257,108 @@ def test_mimo_model_project_grouped_audio_embeds_validates_shape() -> None:
         assert "speech group dimension" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("bad group dimension should fail")
+
+
+def test_mimo_model_projects_hidden_states_to_local_dim() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=2, input_local_dim=3))
+    with torch.no_grad():
+        model.hidden_states_downcast.weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [1.0, 1.0],
+                ]
+            )
+        )
+        model.hidden_states_downcast.bias.zero_()
+
+    local_hidden = model.project_hidden_states_to_local(torch.tensor([[2.0, 3.0]]))
+
+    assert torch.equal(local_hidden, torch.tensor([[2.0, 3.0, 5.0]]))
+
+
+def test_mimo_model_project_hidden_states_validates_hidden_size() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=2))
+
+    try:
+        model.project_hidden_states_to_local(torch.zeros(1, 3))
+    except ValueError as exc:
+        assert "hidden_size" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad hidden size should fail")
+
+
+def test_mimo_model_computes_local_code_logits_per_channel() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(input_local_dim=2))
+    with torch.no_grad():
+        model.local_transformer_lm_heads[0].weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [1.0, 1.0],
+                    [2.0, 0.0],
+                    [0.0, 2.0],
+                ]
+            )
+        )
+        model.local_transformer_lm_heads[1].weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [1.0, 1.0],
+                    [2.0, 0.0],
+                    [0.0, 2.0],
+                    [2.0, 2.0],
+                ]
+            )
+        )
+
+    logits = model.compute_local_code_logits(torch.tensor([[2.0, 3.0]]))
+
+    assert len(logits) == 2
+    assert torch.equal(logits[0], torch.tensor([[2.0, 3.0, 5.0, 4.0, 6.0]]))
+    assert torch.equal(
+        logits[1],
+        torch.tensor([[2.0, 3.0, 5.0, 4.0, 6.0, 10.0]]),
+    )
+
+
+def test_mimo_model_compute_local_code_logits_validates_local_dim() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(input_local_dim=2))
+
+    try:
+        model.compute_local_code_logits(torch.zeros(1, 3))
+    except ValueError as exc:
+        assert "input_local_dim" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad local hidden size should fail")
+
+
+def test_mimo_local_transformer_defaults_to_identity() -> None:
+    transformer = MiMoLocalTransformer()
+    values = torch.randn(2, 3)
+
+    assert transformer(values) is values
+
+
+def test_mimo_model_compute_local_code_logits_uses_replaceable_local_transformer() -> None:
+    class _Shift(torch.nn.Module):
+        def forward(self, values):
+            return values + 1
+
+    model = MiMoV2ASRForCausalLM(_tiny_config(input_local_dim=2))
+    model.local_transformer = MiMoLocalTransformer(_Shift())
+    with torch.no_grad():
+        model.local_transformer_lm_heads[0].weight.fill_(1.0)
+        model.local_transformer_lm_heads[1].weight.fill_(1.0)
+
+    logits = model.compute_local_code_logits(torch.tensor([[2.0, 3.0]]))
+
+    assert torch.equal(logits[0], torch.full((1, 5), 7.0))
+    assert torch.equal(logits[1], torch.full((1, 6), 7.0))
 
 
 def test_mimo_model_get_audio_feature_uses_model_specific_audio_codes() -> None:
@@ -673,11 +781,82 @@ def test_mimo_model_load_weights_rejects_language_weights_before_backbone() -> N
         raise AssertionError("language weights should fail before backbone is built")
 
 
+def test_mimo_model_load_weights_loads_injected_input_local_transformer() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(input_local_dim=2))
+    transformer = torch.nn.Linear(2, 2)
+    model.input_local_transformer = MiMoInputLocalTransformer(transformer)
+    weights = [
+        (
+            "input_local_transformer.weight",
+            torch.full_like(transformer.weight, 1.25),
+        ),
+        ("input_local_transformer.bias", torch.full_like(transformer.bias, 2.25)),
+    ]
+
+    loaded = model.load_weights(weights)
+
+    assert loaded == {
+        "input_local_transformer.weight",
+        "input_local_transformer.bias",
+    }
+    assert torch.equal(
+        transformer.weight,
+        torch.full_like(transformer.weight, 1.25),
+    )
+    assert torch.equal(transformer.bias, torch.full_like(transformer.bias, 2.25))
+
+
+def test_mimo_model_load_weights_loads_local_transformer_lm_heads() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(input_local_dim=2))
+    head_weight = torch.full_like(model.local_transformer_lm_heads[0].weight, 3.25)
+
+    loaded = model.load_weights(
+        [("local_transformer_lm_heads.0.weight", head_weight)]
+    )
+
+    assert loaded == {"local_transformer_lm_heads.0.weight"}
+    assert torch.equal(model.local_transformer_lm_heads[0].weight, head_weight)
+
+
+def test_mimo_model_load_weights_loads_injected_local_transformer() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(input_local_dim=2))
+    transformer = torch.nn.Linear(2, 2)
+    model.local_transformer = MiMoLocalTransformer(transformer)
+    weights = [
+        ("local_transformer.weight", torch.full_like(transformer.weight, 4.25)),
+        ("local_transformer.bias", torch.full_like(transformer.bias, 5.25)),
+    ]
+
+    loaded = model.load_weights(weights)
+
+    assert loaded == {"local_transformer.weight", "local_transformer.bias"}
+    assert torch.equal(
+        transformer.weight,
+        torch.full_like(transformer.weight, 4.25),
+    )
+    assert torch.equal(transformer.bias, torch.full_like(transformer.bias, 5.25))
+
+
+def test_mimo_model_load_weights_rejects_default_input_local_transformer() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+
+    try:
+        model.load_weights(
+            [("input_local_transformer.layers.0.weight", torch.tensor([1.0]))]
+        )
+    except NotImplementedError as exc:
+        assert "input_local_transformer" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("default input local transformer weights should fail")
+
+
 def test_mimo_model_load_weights_rejects_pending_local_transformer_prefixes() -> None:
     model = MiMoV2ASRForCausalLM(_tiny_config())
 
     try:
-        model.load_weights([("local_transformer.layers.0.weight", torch.tensor([1.0]))])
+        model.load_weights(
+            [("local_transformer.layers.0.weight", torch.tensor([1.0]))]
+        )
     except NotImplementedError as exc:
         assert "local_transformer" in str(exc)
     else:  # pragma: no cover - defensive

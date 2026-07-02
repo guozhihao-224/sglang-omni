@@ -158,6 +158,19 @@ class MiMoInputLocalTransformer(nn.Module):
         return self.module(speech_embeddings)
 
 
+class MiMoLocalTransformer(nn.Module):
+    """Replaceable wrapper for MiMo's decode-time local transformer."""
+
+    def __init__(self, module: nn.Module | None = None) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, local_hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.module is None:
+            return local_hidden_states
+        return self.module(local_hidden_states)
+
+
 class MiMoV2ASRForCausalLM(nn.Module):
     """Placeholder for the native MiMo-ASR SGLang model implementation."""
 
@@ -201,6 +214,11 @@ class MiMoV2ASRForCausalLM(nn.Module):
         self.hidden_states_downcast = nn.Linear(
             hidden_size,
             input_local_dim,
+        )
+        self.local_transformer = MiMoLocalTransformer()
+        self.local_transformer_lm_heads = nn.ModuleList(
+            nn.Linear(input_local_dim, vocab_size, bias=False)
+            for vocab_size in self.speech_vocab_sizes
         )
 
     def build_language_model(self) -> nn.Module:
@@ -286,6 +304,37 @@ class MiMoV2ASRForCausalLM(nn.Module):
         """Encode MiMo audio codes into ``[groups, hidden_size]`` embeddings."""
 
         return self.project_grouped_audio_embeds(self.embed_grouped_audio_codes(codes))
+
+    def project_hidden_states_to_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project LM hidden states to MiMo local-transformer dimension."""
+
+        if hidden_states.ndim < 2:
+            raise ValueError(
+                "hidden_states must end with hidden_size, got "
+                f"shape {tuple(hidden_states.shape)}"
+            )
+        if int(hidden_states.shape[-1]) != int(self.config.hidden_size):
+            raise ValueError(
+                "hidden_states last dimension must match hidden_size "
+                f"({hidden_states.shape[-1]} != {self.config.hidden_size})"
+            )
+        return self.hidden_states_downcast(hidden_states)
+
+    def compute_local_code_logits(self, local_hidden_states: torch.Tensor) -> list[torch.Tensor]:
+        """Compute per-channel MiMo RVQ logits from local hidden states."""
+
+        if local_hidden_states.ndim < 2:
+            raise ValueError(
+                "local_hidden_states must end with input_local_dim, got "
+                f"shape {tuple(local_hidden_states.shape)}"
+            )
+        if int(local_hidden_states.shape[-1]) != int(self.config.input_local_dim):
+            raise ValueError(
+                "local_hidden_states last dimension must match input_local_dim "
+                f"({local_hidden_states.shape[-1]} != {self.config.input_local_dim})"
+            )
+        transformed = self.local_transformer(local_hidden_states)
+        return [head(transformed) for head in self.local_transformer_lm_heads]
 
     def get_audio_feature(self, items: list[Any]) -> torch.Tensor:
         """Encode multimodal audio items into hidden-size embeddings.
@@ -604,17 +653,19 @@ class MiMoV2ASRForCausalLM(nn.Module):
         """
 
         pending_language_weights: list[tuple[str, torch.Tensor]] = []
-        pending_mimo_prefixes: set[str] = set()
+        pending_mimo_weights: list[tuple[str, torch.Tensor]] = []
         loaded: set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
             route = route_mimo_weight_name(name)
             if route == "language_model":
-                pending_language_weights.append((name.removeprefix(_LANGUAGE_MODEL_PREFIX), loaded_weight))
+                pending_language_weights.append(
+                    (name.removeprefix(_LANGUAGE_MODEL_PREFIX), loaded_weight)
+                )
                 continue
             if route == "pending_mimo":
-                pending_mimo_prefixes.add(name.split(".", 1)[0])
+                pending_mimo_weights.append((name, loaded_weight))
                 continue
             if route == "unknown":
                 continue
@@ -631,15 +682,52 @@ class MiMoV2ASRForCausalLM(nn.Module):
                     "MiMo-ASR Qwen2 language_model is not built yet; cannot load model.* weights"
                 )
             self.language_model.load_weights(pending_language_weights)
-            loaded.update(f"{_LANGUAGE_MODEL_PREFIX}{name}" for name, _ in pending_language_weights)
+            loaded.update(
+                f"{_LANGUAGE_MODEL_PREFIX}{name}"
+                for name, _ in pending_language_weights
+            )
 
-        if pending_mimo_prefixes:
+        missing_mimo_prefixes: set[str] = set()
+        for name, loaded_weight in pending_mimo_weights:
+            if self._load_pending_mimo_weight(name, loaded_weight):
+                loaded.add(name)
+            else:
+                missing_mimo_prefixes.add(name.split(".", 1)[0])
+
+        if missing_mimo_prefixes:
             raise NotImplementedError(
                 "MiMo-ASR local transformer weight loading is not implemented yet for prefixes: "
-                + ", ".join(sorted(pending_mimo_prefixes))
+                + ", ".join(sorted(missing_mimo_prefixes))
             )
 
         return loaded
+
+    def _load_pending_mimo_weight(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+    ) -> bool:
+        for prefix in _PENDING_MIMO_PREFIXES:
+            if not name.startswith(prefix):
+                continue
+            module_name = prefix[:-1]
+            module = getattr(self, module_name, None)
+            if module is None:
+                return False
+            local_name = name.removeprefix(prefix)
+            if isinstance(
+                module,
+                (MiMoInputLocalTransformer, MiMoLocalTransformer),
+            ) and module.module is not None:
+                module = module.module
+            params_dict = dict(module.named_parameters(remove_duplicate=False))
+            param = params_dict.get(local_name)
+            if param is None:
+                return False
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            return True
+        return False
 
 
 def route_mimo_weight_name(name: str) -> str:
@@ -660,6 +748,7 @@ EntryClass = MiMoV2ASRForCausalLM
 __all__ = [
     "MiMoV2ASRForCausalLM",
     "MiMoInputLocalTransformer",
+    "MiMoLocalTransformer",
     "group_mimo_audio_codes",
     "normalize_mimo_audio_codes",
     "pad_mimo_audio_codes_to_group",
