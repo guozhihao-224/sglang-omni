@@ -348,7 +348,7 @@ Maintain an explicit **skip allowlist** for optional keys absent from this check
 | Prefix | Load? | Role |
 |--------|-------|------|
 | `model.*` | Yes | 36L Qwen2 LM → SGLang `Qwen2ForCausalLM` |
-| `lm_head.*` | Yes | Untied output head |
+| `lm_head.*` | Optional | Current ASR checkpoint omits this prefix; load it if present |
 | `speech_embeddings.{0-7}.*` | Yes | 8-channel code embeddings |
 | `input_local_transformer.*` | Yes | Prefill audio re-encoding |
 | `speech_group_downcast.*` | Yes | Group → hidden |
@@ -562,7 +562,7 @@ Load all prefixes present in the ASR checkpoint:
 - `input_local_transformer` (6 layers, prefill re-encoding).
 - `speech_group_downcast`, `hidden_states_downcast`.
 - **`local_transformer`** (16 layers) and **`local_transformer_lm_heads`** — required for decode when the global LM emits `<|empty|>`; this is **not** TTS-only despite the name.
-- `lm_head` (untied).
+- `lm_head` is optional; the current ASR checkpoint omits this prefix.
 
 Do **not** expect TTS/code2wav/vocoder weights in the ASR checkpoint. Derive required vs skippable keys from the checkpoint index; maintain a skip allowlist for absent optional prefixes only.
 

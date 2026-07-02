@@ -385,6 +385,91 @@ class MiMoV2ASRForCausalLM(nn.Module):
         transformed = self.local_transformer(local_hidden_states)
         return [head(transformed) for head in self.local_transformer_lm_heads]
 
+    def sample_local_code_ids(
+        self,
+        logits: list[torch.Tensor],
+        *,
+        do_sample: bool = True,
+        temperature: float = 0.9,
+        top_p: float = 0.95,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Sample MiMo RVQ code ids from per-channel local logits."""
+
+        if len(logits) != self.audio_channels:
+            raise ValueError(
+                "local logits channel count must match audio_channels "
+                f"({len(logits)} != {self.audio_channels})"
+            )
+        sampled_channels = [
+            self._sample_logits(
+                channel_logits,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                generator=generator,
+            )
+            for channel_logits in logits
+        ]
+        return torch.stack(sampled_channels, dim=-1)
+
+    def local_forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        do_sample: bool = True,
+        temperature: float = 0.9,
+        top_p: float = 0.95,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Generate per-channel MiMo local code ids from LM hidden states."""
+
+        local_hidden_states = self.project_hidden_states_to_local(hidden_states)
+        logits = self.compute_local_code_logits(local_hidden_states)
+        return self.sample_local_code_ids(
+            logits,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            generator=generator,
+        )
+
+    @staticmethod
+    def _sample_logits(
+        logits: torch.Tensor,
+        *,
+        do_sample: bool,
+        temperature: float,
+        top_p: float,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        if logits.ndim < 1:
+            raise ValueError("logits must have at least one dimension")
+        if not do_sample:
+            return torch.argmax(logits, dim=-1)
+        if temperature <= 0:
+            raise ValueError(f"temperature must be > 0, got {temperature}")
+        if top_p <= 0 or top_p > 1:
+            raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+
+        original_shape = logits.shape[:-1]
+        vocab_size = int(logits.shape[-1])
+        flat_logits = logits.reshape(-1, vocab_size) / float(temperature)
+        probs = torch.softmax(flat_logits, dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        remove_mask = cumulative_probs > float(top_p)
+        remove_mask[:, 0] = False
+        sorted_probs = sorted_probs.masked_fill(remove_mask, 0.0)
+        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+        sampled_sorted = torch.multinomial(
+            sorted_probs,
+            1,
+            generator=generator,
+        ).squeeze(-1)
+        sampled = sorted_indices.gather(1, sampled_sorted.unsqueeze(-1)).squeeze(-1)
+        return sampled.reshape(original_shape)
+
     def get_audio_feature(self, items: list[Any]) -> torch.Tensor:
         """Encode multimodal audio items into hidden-size embeddings.
 

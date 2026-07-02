@@ -401,6 +401,108 @@ def test_mimo_model_compute_local_code_logits_uses_replaceable_local_transformer
     assert torch.equal(logits[1], torch.full((1, 6), 7.0))
 
 
+def test_mimo_model_sample_local_code_ids_greedy() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(input_local_dim=2, local_dim=2))
+    logits = [
+        torch.tensor([[1.0, 4.0, 3.0, 2.0, 0.0]]),
+        torch.tensor([[1.0, 0.0, 2.0, 5.0, 3.0, 4.0]]),
+    ]
+
+    codes = model.sample_local_code_ids(logits, do_sample=False)
+
+    assert torch.equal(codes, torch.tensor([[1, 3]]))
+
+
+def test_mimo_model_sample_local_code_ids_top_p_keeps_highest_token() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(input_local_dim=2, local_dim=2))
+    logits = [
+        torch.tensor([[0.0, 10.0, 1.0, 2.0, 3.0]]),
+        torch.tensor([[0.0, 1.0, 2.0, 3.0, 4.0, 10.0]]),
+    ]
+    generator = torch.Generator().manual_seed(0)
+
+    codes = model.sample_local_code_ids(
+        logits,
+        do_sample=True,
+        temperature=1.0,
+        top_p=0.01,
+        generator=generator,
+    )
+
+    assert torch.equal(codes, torch.tensor([[1, 5]]))
+
+
+def test_mimo_model_local_forward_generates_greedy_codes() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=2, input_local_dim=2, local_dim=2))
+    with torch.no_grad():
+        model.hidden_states_downcast.weight.copy_(torch.eye(2))
+        model.local_transformer_lm_heads[0].weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [1.0, 1.0],
+                    [2.0, 0.0],
+                    [0.0, 2.0],
+                ]
+            )
+        )
+        model.local_transformer_lm_heads[1].weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [1.0, 1.0],
+                    [2.0, 0.0],
+                    [0.0, 2.0],
+                    [2.0, 2.0],
+                ]
+            )
+        )
+
+    codes = model.local_forward(torch.tensor([[2.0, 3.0]]), do_sample=False)
+
+    assert torch.equal(codes, torch.tensor([[4, 5]]))
+
+
+def test_mimo_model_local_forward_preserves_prefix_shape() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=2, input_local_dim=2, local_dim=2))
+    with torch.no_grad():
+        model.hidden_states_downcast.weight.copy_(torch.eye(2))
+        for head in model.local_transformer_lm_heads:
+            head.weight.fill_(1.0)
+
+    codes = model.local_forward(torch.ones(2, 3, 2), do_sample=False)
+
+    assert codes.shape == (2, 3, 2)
+
+
+def test_mimo_model_sample_local_code_ids_validates_inputs() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(input_local_dim=2, local_dim=2))
+
+    try:
+        model.sample_local_code_ids([torch.zeros(1, 5)], do_sample=False)
+    except ValueError as exc:
+        assert "audio_channels" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad channel count should fail")
+
+    logits = [torch.zeros(1, 5), torch.zeros(1, 6)]
+    try:
+        model.sample_local_code_ids(logits, temperature=0.0)
+    except ValueError as exc:
+        assert "temperature" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad temperature should fail")
+
+    try:
+        model.sample_local_code_ids(logits, top_p=1.5)
+    except ValueError as exc:
+        assert "top_p" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad top_p should fail")
+
+
 def test_mimo_model_get_audio_feature_uses_model_specific_audio_codes() -> None:
     config = _tiny_config(hidden_size=1)
     model = MiMoV2ASRForCausalLM(config)
