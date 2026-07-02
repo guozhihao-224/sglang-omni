@@ -660,9 +660,9 @@ def test_mimo_decode_groups_helper_batches_regular_empty_and_stop() -> None:
         groups,
         torch.tensor(
             [
-                [8, 4, 5, 99, 4, 5],
-                [99, 10, 20, 99, 11, 21],
-                [42, 4, 5, 99, 4, 5],
+                [8, 4, 5, 0, 4, 5],
+                [99, 10, 20, 0, 11, 21],
+                [42, 4, 5, 0, 4, 5],
             ]
         ),
     )
@@ -754,9 +754,9 @@ def test_mimo_runner_post_decode_preserves_scheduler_text_ids() -> None:
         result.mimo_asr_decode_groups,
         torch.tensor(
             [
-                [8, 4, 5, 0, 4, 5],
-                [99, 10, 20, 0, 11, 21],
-                [42, 4, 5, 0, 4, 5],
+                [8, 4, 5, 99, 4, 5],
+                [99, 10, 20, 99, 11, 21],
+                [42, 4, 5, 99, 4, 5],
             ]
         ),
     )
@@ -778,7 +778,7 @@ def test_mimo_runner_post_prefill_samples_missing_text_ids() -> None:
     assert torch.equal(result.next_token_ids, torch.tensor([7]))
     assert torch.equal(
         result.mimo_asr_decode_groups,
-        torch.tensor([[7, 4, 5, model.empty_token_id, 4, 5]]),
+        torch.tensor([[7, 4, 5, model.config.empty_token_id, 4, 5]]),
     )
 
 
