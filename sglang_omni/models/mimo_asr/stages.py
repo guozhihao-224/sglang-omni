@@ -48,6 +48,7 @@ def create_sglang_mimo_asr_executor(
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
     server_args_overrides = dict(server_args_overrides or {})
     enable_async_decode = bool(server_args_overrides.pop("enable_async_decode", False))
+    context_length = int(server_args_overrides.pop("context_length", 8192))
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     audio_tokenizer = MiMoAudioTokenizerAdapter(
@@ -73,7 +74,7 @@ def create_sglang_mimo_asr_executor(
 
     server_args = build_sglang_server_args(
         model_path,
-        context_length=int(max_new_tokens) + 8192,
+        context_length=context_length,
         **overrides,
     )
     validate_generation_batch_policy(

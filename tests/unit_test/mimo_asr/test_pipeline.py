@@ -242,7 +242,7 @@ def test_mimo_asr_stage_wires_native_scheduler_components(monkeypatch) -> None:
     assert build_kwargs["chunked_prefill_size"] == 8192
     assert build_kwargs["sampling_backend"] == "pytorch"
     assert build_kwargs["dtype"] == "bfloat16"
-    assert build_kwargs["context_length"] == 8448
+    assert build_kwargs["context_length"] == 8192
     assert infrastructure_kwargs == {
         "gpu_id": 3,
         "model_arch_override": "MiMoV2ASRForCausalLM",
