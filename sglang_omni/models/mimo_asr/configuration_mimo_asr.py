@@ -30,9 +30,12 @@ class MiMoV2ASRConfig(Qwen2Config):
         delay_pattern: str = "0-1-2-3-4-5-6-7",
         empty_token_id: int = 151667,
         stop_token_id: int = 151645,
+        rope_theta: float | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
+        if rope_theta is not None:
+            self.rope_theta = rope_theta
         self.audio_channels = audio_channels
         self.group_size = group_size
         self.input_local_layers = input_local_layers
