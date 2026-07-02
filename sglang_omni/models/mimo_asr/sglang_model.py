@@ -14,6 +14,7 @@ import torch.nn as nn
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 from .configuration_mimo_asr import MiMoV2ASRConfig
 
@@ -38,6 +39,20 @@ def validate_mimo_speech_config(config: MiMoV2ASRConfig) -> None:
         raise ValueError(f"audio_channels must be >= 1, got {config.audio_channels}")
     if int(config.group_size) < 1:
         raise ValueError(f"group_size must be >= 1, got {config.group_size}")
+    if int(config.local_attn_heads) < 1:
+        raise ValueError(
+            f"local_attn_heads must be >= 1, got {config.local_attn_heads}"
+        )
+    if int(config.input_local_dim) % int(config.local_attn_heads) != 0:
+        raise ValueError(
+            "input_local_dim must be divisible by local_attn_heads "
+            f"({config.input_local_dim} % {config.local_attn_heads})"
+        )
+    if int(config.local_dim) % int(config.local_attn_heads) != 0:
+        raise ValueError(
+            "local_dim must be divisible by local_attn_heads "
+            f"({config.local_dim} % {config.local_attn_heads})"
+        )
 
     speech_vocab_sizes = config.speech_vocab_sizes
     speech_zeroemb_indices = config.speech_zeroemb_indices
@@ -143,9 +158,9 @@ def group_mimo_audio_codes(
 class MiMoInputLocalTransformer(nn.Module):
     """Replaceable wrapper for MiMo's input-local transformer.
 
-    The official module is still pending.  This wrapper gives the prefill path a
-    stable module boundary: identity by default, or any injected ``nn.Module``
-    with the same ``[groups, group_size, input_local_dim]`` tensor contract.
+    This wrapper gives the prefill path a stable module boundary: Qwen2 by
+    default for real configs, identity for zero-layer tests, or any injected
+    ``nn.Module`` with the same tensor contract.
     """
 
     def __init__(self, module: nn.Module | None = None) -> None:
@@ -155,7 +170,7 @@ class MiMoInputLocalTransformer(nn.Module):
     def forward(self, speech_embeddings: torch.Tensor) -> torch.Tensor:
         if self.module is None:
             return speech_embeddings
-        return self.module(speech_embeddings)
+        return _run_local_transformer_module(self.module, speech_embeddings)
 
 
 class MiMoLocalTransformer(nn.Module):
@@ -168,7 +183,31 @@ class MiMoLocalTransformer(nn.Module):
     def forward(self, local_hidden_states: torch.Tensor) -> torch.Tensor:
         if self.module is None:
             return local_hidden_states
-        return self.module(local_hidden_states)
+        return _run_local_transformer_module(self.module, local_hidden_states)
+
+
+def _run_local_transformer_module(
+    module: nn.Module,
+    inputs_embeds: torch.Tensor,
+) -> torch.Tensor:
+    if isinstance(module, Qwen2Model):
+        outputs = module(inputs_embeds=inputs_embeds)
+    else:
+        outputs = module(inputs_embeds)
+    if hasattr(outputs, "last_hidden_state"):
+        return outputs.last_hidden_state
+    return outputs[0] if isinstance(outputs, tuple) else outputs
+
+
+def _build_local_qwen2_model(
+    config: MiMoV2ASRConfig,
+    *,
+    input_local: bool,
+) -> Qwen2Model:
+    local_config = config.input_local_config() if input_local else config.local_config()
+    model = Qwen2Model(local_config)
+    model.embed_tokens = None
+    return model
 
 
 class MiMoV2ASRForCausalLM(nn.Module):
@@ -209,15 +248,25 @@ class MiMoV2ASRForCausalLM(nn.Module):
         self.speech_group_downcast = nn.Linear(
             self.group_size * input_local_dim,
             hidden_size,
+            bias=False,
         )
-        self.input_local_transformer = MiMoInputLocalTransformer()
+        self.input_local_transformer = MiMoInputLocalTransformer(
+            _build_local_qwen2_model(config, input_local=True)
+            if int(config.input_local_layers) > 0
+            else None
+        )
         self.hidden_states_downcast = nn.Linear(
             hidden_size,
-            input_local_dim,
+            int(config.local_dim),
+            bias=False,
         )
-        self.local_transformer = MiMoLocalTransformer()
+        self.local_transformer = MiMoLocalTransformer(
+            _build_local_qwen2_model(config, input_local=False)
+            if int(config.local_layers) > 0
+            else None
+        )
         self.local_transformer_lm_heads = nn.ModuleList(
-            nn.Linear(input_local_dim, vocab_size, bias=False)
+            nn.Linear(int(config.local_dim), vocab_size, bias=False)
             for vocab_size in self.speech_vocab_sizes
         )
 
@@ -325,13 +374,13 @@ class MiMoV2ASRForCausalLM(nn.Module):
 
         if local_hidden_states.ndim < 2:
             raise ValueError(
-                "local_hidden_states must end with input_local_dim, got "
+                "local_hidden_states must end with local_dim, got "
                 f"shape {tuple(local_hidden_states.shape)}"
             )
-        if int(local_hidden_states.shape[-1]) != int(self.config.input_local_dim):
+        if int(local_hidden_states.shape[-1]) != int(self.config.local_dim):
             raise ValueError(
-                "local_hidden_states last dimension must match input_local_dim "
-                f"({local_hidden_states.shape[-1]} != {self.config.input_local_dim})"
+                "local_hidden_states last dimension must match local_dim "
+                f"({local_hidden_states.shape[-1]} != {self.config.local_dim})"
             )
         transformed = self.local_transformer(local_hidden_states)
         return [head(transformed) for head in self.local_transformer_lm_heads]
@@ -678,9 +727,7 @@ class MiMoV2ASRForCausalLM(nn.Module):
 
         if pending_language_weights:
             if self.language_model is None:
-                raise NotImplementedError(
-                    "MiMo-ASR Qwen2 language_model is not built yet; cannot load model.* weights"
-                )
+                self.build_language_model()
             self.language_model.load_weights(pending_language_weights)
             loaded.update(
                 f"{_LANGUAGE_MODEL_PREFIX}{name}"
@@ -715,6 +762,8 @@ class MiMoV2ASRForCausalLM(nn.Module):
             if module is None:
                 return False
             local_name = name.removeprefix(prefix)
+            if _should_skip_local_transformer_weight(local_name):
+                return True
             if isinstance(
                 module,
                 (MiMoInputLocalTransformer, MiMoLocalTransformer),
@@ -728,6 +777,10 @@ class MiMoV2ASRForCausalLM(nn.Module):
             weight_loader(param, loaded_weight)
             return True
         return False
+
+
+def _should_skip_local_transformer_weight(local_name: str) -> bool:
+    return local_name == "embed_tokens.weight" or "rotary_emb." in local_name
 
 
 def route_mimo_weight_name(name: str) -> str:

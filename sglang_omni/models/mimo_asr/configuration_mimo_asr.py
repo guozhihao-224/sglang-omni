@@ -25,6 +25,11 @@ class MiMoV2ASRConfig(Qwen2Config):
         input_local_layers: int = 6,
         input_local_dim: int = 1024,
         input_full_attention: bool = True,
+        local_dim: int = 1024,
+        local_layers: int = 16,
+        local_attn_heads: int = 64,
+        local_ffn_dim: int = 4096,
+        local_attn_dropout: float = 0.1,
         speech_vocab_size: str = "1025-1025-129-129-129-129-129-129",
         speech_zeroemb_idx: str = "1024-1024-128-128-128-128-128-128",
         delay_pattern: str = "0-1-2-3-4-5-6-7",
@@ -41,6 +46,11 @@ class MiMoV2ASRConfig(Qwen2Config):
         self.input_local_layers = input_local_layers
         self.input_local_dim = input_local_dim
         self.input_full_attention = input_full_attention
+        self.local_dim = local_dim
+        self.local_layers = local_layers
+        self.local_attn_heads = local_attn_heads
+        self.local_ffn_dim = local_ffn_dim
+        self.local_attn_dropout = local_attn_dropout
         self.speech_vocab_size = speech_vocab_size
         self.speech_zeroemb_idx = speech_zeroemb_idx
         self.delay_pattern = delay_pattern
@@ -61,6 +71,33 @@ class MiMoV2ASRConfig(Qwen2Config):
 
     def get_text_config(self, decoder: bool = False):
         return self
+
+    def local_config(self):
+        config = self._copy_for_local_transformer()
+        config.hidden_size = int(self.local_dim)
+        config.num_hidden_layers = int(self.local_layers)
+        config.num_attention_heads = int(self.local_attn_heads)
+        config.num_key_value_heads = int(self.local_attn_heads)
+        config.intermediate_size = int(self.local_ffn_dim)
+        config.attention_dropout = float(self.local_attn_dropout)
+        config.vocab_size = 1
+        config.head_dim = config.hidden_size // config.num_attention_heads
+        return config
+
+    def input_local_config(self):
+        config = self._copy_for_local_transformer()
+        config.hidden_size = int(self.input_local_dim)
+        config.num_hidden_layers = int(self.input_local_layers)
+        config.num_attention_heads = int(self.local_attn_heads)
+        config.num_key_value_heads = int(self.local_attn_heads)
+        config.intermediate_size = config.hidden_size * 4
+        config.attention_dropout = float(self.local_attn_dropout)
+        config.vocab_size = 1
+        config.head_dim = config.hidden_size // config.num_attention_heads
+        return config
+
+    def _copy_for_local_transformer(self):
+        return self.__class__(**self.to_dict())
 
 
 def _parse_dash_ints(value: str) -> list[int]:
