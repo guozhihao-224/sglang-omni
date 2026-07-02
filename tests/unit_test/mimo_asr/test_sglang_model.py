@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
 from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
 from sglang_omni.models.mimo_asr.model_runner import (
@@ -49,6 +50,37 @@ def _tiny_config(**overrides) -> MiMoV2ASRConfig:
     }
     defaults.update(overrides)
     return MiMoV2ASRConfig(**defaults)
+
+
+def test_mimo_model_accepts_plain_qwen2_config_with_mimo_fields() -> None:
+    config = Qwen2Config(
+        vocab_size=128,
+        hidden_size=7,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=8,
+        audio_channels=2,
+        group_size=2,
+        input_local_layers=0,
+        input_local_dim=3,
+        local_dim=3,
+        local_layers=0,
+        local_attn_heads=1,
+        local_ffn_dim=4,
+        speech_vocab_size="5-6",
+        speech_zeroemb_idx="4-5",
+        delay_pattern="0-1",
+        empty_token_id=99,
+        stop_token_id=42,
+    )
+
+    model = MiMoV2ASRForCausalLM(config)
+
+    assert isinstance(model.config, MiMoV2ASRConfig)
+    assert model.speech_vocab_sizes == [5, 6]
+    assert model.speech_zeroemb_indices == [4, 5]
+    assert model.config.empty_token_id == 99
 
 
 class _FakeMMItem:

@@ -17,7 +17,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
-from .configuration_mimo_asr import MiMoV2ASRConfig
+from .configuration_mimo_asr import MiMoV2ASRConfig, coerce_mimo_asr_config
 
 _LANGUAGE_MODEL_PREFIX = "model."
 _SUPPORTED_DIRECT_PREFIXES = (
@@ -221,6 +221,7 @@ class MiMoV2ASRForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        config = coerce_mimo_asr_config(config)
         validate_mimo_speech_config(config)
         self.config = config
         self.quant_config = quant_config

@@ -106,4 +106,16 @@ def _parse_dash_ints(value: str) -> list[int]:
     return [int(part) for part in value.split("-")]
 
 
-__all__ = ["MiMoV2ASRConfig"]
+def coerce_mimo_asr_config(config) -> MiMoV2ASRConfig:
+    """Return a MiMo config even when SGLang loaded a plain Qwen2Config."""
+
+    if isinstance(config, MiMoV2ASRConfig):
+        return config
+    if hasattr(config, "to_dict"):
+        return MiMoV2ASRConfig(**config.to_dict())
+    if isinstance(config, dict):
+        return MiMoV2ASRConfig(**config)
+    raise TypeError(f"unsupported MiMo config type: {type(config).__name__}")
+
+
+__all__ = ["MiMoV2ASRConfig", "coerce_mimo_asr_config"]
