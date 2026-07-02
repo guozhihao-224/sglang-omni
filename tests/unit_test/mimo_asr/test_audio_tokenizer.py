@@ -249,7 +249,13 @@ def test_official_backend_matches_vllm_encode_shape_and_channel_slice() -> None:
         ((6000, 80), (6000,)),
         ((501, 80), (501,)),
     ]
-    expected = torch.arange(12 * 6501, dtype=torch.long).reshape(12, 6501)[:8]
+    expected = torch.cat(
+        [
+            torch.arange(12 * 6000, dtype=torch.long).reshape(12, 6000),
+            torch.arange(12 * 501, dtype=torch.long).reshape(12, 501),
+        ],
+        dim=1,
+    )[:8]
     assert torch.equal(codes, expected)
 
 
