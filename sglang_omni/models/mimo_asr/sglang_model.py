@@ -452,10 +452,15 @@ class MiMoV2ASRForCausalLM(nn.Module):
     ) -> torch.Tensor:
         """Prepare text/audio ``inputs_embeds`` for the language backbone."""
 
-        safe_input_ids = self._restore_placeholder_ids_for_embedding(input_ids, items)
+        token_embedding = self._get_token_embedding_module()
+        safe_input_ids = self._restore_placeholder_ids_for_embedding(
+            input_ids,
+            items,
+            token_embedding,
+        )
         return self.embed_input_ids(
             safe_input_ids,
-            self._get_token_embedding_module(),
+            token_embedding,
             items,
         )
 
@@ -463,10 +468,12 @@ class MiMoV2ASRForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         items: list[Any] | None,
+        token_embedding: nn.Module,
     ) -> torch.Tensor:
         if not items:
             return input_ids
         safe_input_ids = input_ids.clone()
+        placeholder_id = self._safe_placeholder_id_for_embedding(token_embedding)
         for item in items:
             for position in self._positions_from_offsets(
                 list(getattr(item, "offsets", None) or [])
@@ -476,8 +483,18 @@ class MiMoV2ASRForCausalLM(nn.Module):
                         f"MiMo-ASR offset position {position} is outside "
                         f"input length {safe_input_ids.shape[0]}"
                     )
-                safe_input_ids[position] = int(self.config.empty_token_id)
+                safe_input_ids[position] = placeholder_id
         return safe_input_ids
+
+    def _safe_placeholder_id_for_embedding(self, token_embedding: nn.Module) -> int:
+        placeholder_id = int(self.config.empty_token_id)
+        num_embeddings = getattr(token_embedding, "num_embeddings", None)
+        if num_embeddings is None:
+            weight = getattr(token_embedding, "weight", None)
+            num_embeddings = int(weight.shape[0]) if weight is not None else None
+        if num_embeddings is not None and placeholder_id >= int(num_embeddings):
+            return 0
+        return placeholder_id
 
     def _get_token_embedding_module(self) -> nn.Module:
         language_model = self.build_language_model()
