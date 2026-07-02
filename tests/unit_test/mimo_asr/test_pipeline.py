@@ -49,7 +49,7 @@ def test_mimo_asr_stage_signature_matches_initial_native_plan() -> None:
     )
     assert signature.parameters["device"].default == "cuda:0"
     assert signature.parameters["dtype"].default == "bfloat16"
-    assert signature.parameters["max_running_requests"].default == 8
+    assert signature.parameters["max_running_requests"].default == 1
     assert signature.parameters["max_new_tokens"].default == 8192
     assert signature.parameters["mem_fraction_static"].default is None
     assert signature.parameters["mm_embedding_cache_size_bytes"].default == 0
@@ -168,13 +168,13 @@ def test_mimo_asr_stage_wires_native_scheduler_components(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         mimo_asr_stages,
-        "ModelRunner",
+        "MiMoASRModelRunner",
         lambda *args, **kwargs: SimpleNamespace(args=args, kwargs=kwargs),
     )
     monkeypatch.setattr(
         mimo_asr_stages,
-        "SGLangOutputProcessor",
-        lambda **kwargs: SimpleNamespace(**kwargs),
+        "MiMoASROutputProcessor",
+        lambda: "mimo-output-processor",
     )
     monkeypatch.setattr(
         mimo_asr_stages,
@@ -249,5 +249,7 @@ def test_mimo_asr_stage_wires_native_scheduler_components(monkeypatch) -> None:
     }
     assert scheduler.request_builder is request_builder
     assert scheduler.result_adapter is result_adapter
+    assert scheduler.model_runner.args == (scheduler.tp_worker, "mimo-output-processor")
+    assert scheduler.model_runner.kwargs == {}
     assert scheduler.request_build_max_workers == 1
     assert scheduler.request_build_max_pending == 8
