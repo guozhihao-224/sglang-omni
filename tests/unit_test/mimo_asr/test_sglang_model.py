@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
+from sglang_omni.models.mimo_asr.model_runner import build_mimo_decode_groups
 from sglang_omni.models.mimo_asr.sglang_model import (
     MiMoInputLocalTransformer,
     MiMoLocalTransformer,
@@ -628,6 +629,79 @@ def test_mimo_model_build_decode_step_requires_hidden_for_empty() -> None:
         assert "hidden_states" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("empty decode without hidden_states should fail")
+
+
+def test_mimo_decode_groups_helper_batches_regular_empty_and_stop() -> None:
+    model = MiMoV2ASRForCausalLM(
+        _tiny_config(empty_token_id=99, stop_token_id=42, speech_zeroemb_idx="4-5")
+    )
+    calls = []
+
+    def _fake_local_forward(hidden_states, **kwargs):
+        calls.append((hidden_states, kwargs))
+        return torch.tensor([[10, 20], [11, 21]])
+
+    model.local_forward = _fake_local_forward
+
+    groups, stopped = build_mimo_decode_groups(
+        model,
+        torch.tensor([8, 99, 42]),
+        torch.ones(3, 7),
+        do_sample=False,
+        text_tail_token_id=0,
+    )
+
+    assert torch.equal(
+        groups,
+        torch.tensor(
+            [
+                [8, 4, 5, 0, 4, 5],
+                [99, 10, 20, 0, 11, 21],
+                [42, 4, 5, 0, 4, 5],
+            ]
+        ),
+    )
+    assert torch.equal(stopped, torch.tensor([False, False, True]))
+    assert calls[0][0].shape == (1, 7)
+    assert calls[0][1]["do_sample"] is False
+
+
+def test_mimo_decode_groups_helper_uses_last_hidden_from_sequence() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(empty_token_id=99))
+    captured = []
+
+    def _fake_local_forward(hidden_states, **kwargs):
+        captured.append(hidden_states.clone())
+        return torch.tensor([[10, 20], [11, 21]])
+
+    model.local_forward = _fake_local_forward
+    hidden_states = torch.arange(42, dtype=torch.float32).reshape(1, 6, 7)
+
+    build_mimo_decode_groups(model, torch.tensor([99]), hidden_states)
+
+    assert torch.equal(captured[0], hidden_states[:, -1, :])
+
+
+def test_mimo_decode_groups_helper_validates_shapes() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+
+    try:
+        build_mimo_decode_groups(model, torch.zeros(1, 1, dtype=torch.long), None)
+    except ValueError as exc:
+        assert "text_token_ids" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad text ids shape should fail")
+
+    try:
+        build_mimo_decode_groups(
+            model,
+            torch.zeros(2, dtype=torch.long),
+            torch.zeros(1, 7),
+        )
+    except ValueError as exc:
+        assert "batch size" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad hidden batch size should fail")
 
 
 def test_mimo_model_build_decode_token_group_validates_speech_shape() -> None:

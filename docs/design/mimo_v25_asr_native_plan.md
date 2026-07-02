@@ -97,7 +97,7 @@ Official loop (`modeling_mimo_audio.py`):
 | Layer | Responsibility |
 |-------|----------------|
 | `sglang_model.py` | `_prepare_input_embeds`, `local_forward`, logits / hidden states |
-| **`ModelRunner` subclass** (likely) | After each forward: global sample + local branch + write 36 flat tokens into `req` / KV; see Phase 5 |
+| **`model_runner.py` helper + scheduler integration** | PR #898-style ASR stage remains standard, but MiMo decode must expand sampled text tokens into 36-id flat groups; see Phase 5 |
 | `OmniScheduler` | May stay as shell **if** custom runner satisfies the one-step contract; otherwise extend (Phase 5 Option B) |
 | Request builder | Build 9-row flat prompt + attach RVQ codes; not Qwen3 mel features |
 
@@ -576,7 +576,7 @@ Port `_prepare_input_embeds` from official code:
 
 ### Decode: `slm_sample` Loop
 
-Standard SGLang `_sample_next_token_ids` (one text token per step) is **insufficient**. Implement decode in **`MiMoASRModelRunner`** (Phase 5) calling into model helpers:
+Standard SGLang `_sample_next_token_ids` (one text token per step) is **insufficient**. Keep the PR #898-style ASR stage entry, but add MiMo-specific decode integration around model-runner/scheduler boundaries. The pure helper in `mimo_asr/model_runner.py` expands sampled text ids via model helpers:
 
 1. Run global LM; greedy sample next text token (ASR task).
 2. If token == 151667: `hidden_states_downcast` → `local_forward` → 8×`group_size` RVQ tokens.
