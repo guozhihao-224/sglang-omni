@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 
 from sglang_omni.models.mimo_asr.config import MiMoASRPipelineConfig
+from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
 from sglang_omni.models.mimo_asr.stages import create_sglang_mimo_asr_executor
 from sglang_omni.models.mimo_asr.tool_funcs.audio_lengths import (
     MIMO_ASR_AUDIO_CHANNELS,
@@ -96,3 +97,37 @@ def test_mimo_asr_length_helpers_validate_inputs() -> None:
         assert "text_group_count" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("negative text group count should fail")
+
+
+def test_mimo_asr_config_extends_flat_qwen2_shape_with_audio_fields() -> None:
+    config = MiMoV2ASRConfig(
+        vocab_size=151680,
+        hidden_size=4096,
+        num_hidden_layers=36,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        intermediate_size=11008,
+        rope_theta=640000,
+        max_position_embeddings=8192,
+    )
+
+    assert config.model_type == "qwen2"
+    assert config.get_text_config() is config
+    assert config.vocab_size == 151680
+    assert config.hidden_size == 4096
+    assert config.num_hidden_layers == 36
+    assert config.num_attention_heads == 32
+    assert config.num_key_value_heads == 8
+    assert config.intermediate_size == 11008
+    assert config.rope_theta == 640000
+    assert config.max_position_embeddings == 8192
+    assert config.audio_channels == 8
+    assert config.group_size == 4
+    assert config.input_local_layers == 6
+    assert config.input_local_dim == 1024
+    assert config.input_full_attention is True
+    assert config.speech_vocab_sizes == [1025, 1025, 129, 129, 129, 129, 129, 129]
+    assert config.speech_zeroemb_indices == [1024, 1024, 128, 128, 128, 128, 128, 128]
+    assert config.delay_pattern_values == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert config.empty_token_id == 151667
+    assert config.stop_token_id == 151645
