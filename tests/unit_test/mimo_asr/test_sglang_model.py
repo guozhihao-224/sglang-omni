@@ -8,6 +8,7 @@ import torch
 
 from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
 from sglang_omni.models.mimo_asr.sglang_model import (
+    MiMoInputLocalTransformer,
     MiMoV2ASRForCausalLM,
     group_mimo_audio_codes,
     normalize_mimo_audio_codes,
@@ -127,6 +128,7 @@ def test_mimo_sglang_model_initializes_speech_embedding_modules() -> None:
     assert model.speech_embeddings[1].padding_idx == 5
     assert model.speech_group_downcast.in_features == 6
     assert model.speech_group_downcast.out_features == 7
+    assert isinstance(model.input_local_transformer, MiMoInputLocalTransformer)
     assert model.hidden_states_downcast.in_features == 7
     assert model.hidden_states_downcast.out_features == 3
 
@@ -198,6 +200,31 @@ def test_mimo_model_projects_grouped_audio_embeds_to_hidden_size() -> None:
     projected = model.project_grouped_audio_embeds(embeddings)
 
     assert torch.equal(projected, torch.tensor([[1.0, 4.0], [7.0, 10.0]]))
+
+
+def test_mimo_input_local_transformer_defaults_to_identity() -> None:
+    transformer = MiMoInputLocalTransformer()
+    values = torch.randn(2, 3, 4)
+
+    assert transformer(values) is values
+
+
+def test_mimo_model_project_uses_replaceable_input_local_transformer() -> None:
+    class _Scale(torch.nn.Module):
+        def forward(self, values):
+            return values * 2
+
+    config = _tiny_config(hidden_size=1)
+    model = MiMoV2ASRForCausalLM(config)
+    model.input_local_transformer = MiMoInputLocalTransformer(_Scale())
+    with torch.no_grad():
+        model.speech_group_downcast.weight.fill_(1.0)
+        model.speech_group_downcast.bias.zero_()
+    embeddings = torch.ones(1, 2, 3)
+
+    projected = model.project_grouped_audio_embeds(embeddings)
+
+    assert torch.equal(projected, torch.tensor([[12.0]]))
 
 
 def test_mimo_model_encode_audio_codes_to_hidden_combines_embedding_and_projection() -> None:
@@ -655,3 +682,95 @@ def test_mimo_model_load_weights_rejects_pending_local_transformer_prefixes() ->
         assert "local_transformer" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("pending local transformer weights should fail")
+
+
+class _FakeLanguageModel(torch.nn.Module):
+    def __init__(self, embedding: torch.nn.Embedding) -> None:
+        super().__init__()
+        self.embedding = embedding
+        self.calls: list[dict] = []
+
+    def get_input_embeddings(self):
+        return self.embedding
+
+    def forward(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("inputs_embeds") is not None:
+            return kwargs["inputs_embeds"]
+        return self.embedding(kwargs["input_ids"])
+
+
+def _fake_language_model(hidden_size: int = 1) -> _FakeLanguageModel:
+    embedding = torch.nn.Embedding(256, hidden_size)
+    with torch.no_grad():
+        values = torch.arange(256, dtype=torch.float32).unsqueeze(1).expand(-1, hidden_size)
+        embedding.weight.copy_(values)
+    return _FakeLanguageModel(embedding)
+
+
+def test_mimo_model_prepare_prefill_inputs_embeds_restores_pad_positions() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+    language_model = _fake_language_model(hidden_size=1)
+    model.language_model = language_model
+    with torch.no_grad():
+        for embedding in model.speech_embeddings:
+            embedding.weight.fill_(1.0)
+        model.speech_group_downcast.weight.fill_(1.0)
+        model.speech_group_downcast.bias.zero_()
+    item = _FakeMMItem(torch.tensor([[0, 0], [1, 1]]), pad_value=-1, offsets=[(1, 1)])
+
+    embeds = model.prepare_prefill_inputs_embeds(torch.tensor([5, -1, 6]), [item])
+
+    assert torch.equal(embeds, torch.tensor([[5.0], [12.0], [6.0]]))
+
+
+def test_mimo_model_forward_without_audio_calls_language_model_with_input_ids() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+    language_model = _fake_language_model(hidden_size=1)
+    model.language_model = language_model
+    input_ids = torch.tensor([1, 2, 3])
+    positions = torch.tensor([0, 1, 2])
+    forward_batch = SimpleNamespace()
+
+    output = model.forward(input_ids, positions, forward_batch)
+
+    assert torch.equal(output, torch.tensor([[1.0], [2.0], [3.0]]))
+    assert language_model.calls[-1]["input_ids"] is input_ids
+    assert language_model.calls[-1]["positions"] is positions
+    assert language_model.calls[-1]["forward_batch"] is forward_batch
+    assert "inputs_embeds" not in language_model.calls[-1]
+
+
+def test_mimo_model_forward_with_audio_items_calls_language_model_with_inputs_embeds() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+    language_model = _fake_language_model(hidden_size=1)
+    model.language_model = language_model
+    with torch.no_grad():
+        for embedding in model.speech_embeddings:
+            embedding.weight.fill_(1.0)
+        model.speech_group_downcast.weight.fill_(1.0)
+        model.speech_group_downcast.bias.zero_()
+    item = _FakeMMItem(torch.tensor([[0, 0], [1, 1]]), pad_value=-1, offsets=[(1, 1)])
+    forward_batch = SimpleNamespace(multimodal_inputs=SimpleNamespace(mm_items=[item]))
+
+    output = model.forward(torch.tensor([5, -1, 6]), torch.tensor([0, 1, 2]), forward_batch)
+
+    assert torch.equal(output, torch.tensor([[5.0], [12.0], [6.0]]))
+    assert torch.equal(language_model.calls[-1]["inputs_embeds"], output)
+
+
+def test_mimo_model_forward_accepts_explicit_inputs_embeds() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+    language_model = _fake_language_model(hidden_size=1)
+    model.language_model = language_model
+    inputs_embeds = torch.tensor([[9.0], [8.0]])
+
+    output = model.forward(
+        torch.tensor([1, 2]),
+        torch.tensor([0, 1]),
+        SimpleNamespace(),
+        inputs_embeds=inputs_embeds,
+    )
+
+    assert output is inputs_embeds
+    assert language_model.calls[-1]["inputs_embeds"] is inputs_embeds

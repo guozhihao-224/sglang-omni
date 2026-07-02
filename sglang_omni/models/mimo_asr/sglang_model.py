@@ -140,6 +140,24 @@ def group_mimo_audio_codes(
     )
 
 
+class MiMoInputLocalTransformer(nn.Module):
+    """Replaceable wrapper for MiMo's input-local transformer.
+
+    The official module is still pending.  This wrapper gives the prefill path a
+    stable module boundary: identity by default, or any injected ``nn.Module``
+    with the same ``[groups, group_size, input_local_dim]`` tensor contract.
+    """
+
+    def __init__(self, module: nn.Module | None = None) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, speech_embeddings: torch.Tensor) -> torch.Tensor:
+        if self.module is None:
+            return speech_embeddings
+        return self.module(speech_embeddings)
+
+
 class MiMoV2ASRForCausalLM(nn.Module):
     """Placeholder for the native MiMo-ASR SGLang model implementation."""
 
@@ -179,6 +197,7 @@ class MiMoV2ASRForCausalLM(nn.Module):
             self.group_size * input_local_dim,
             hidden_size,
         )
+        self.input_local_transformer = MiMoInputLocalTransformer()
         self.hidden_states_downcast = nn.Linear(
             hidden_size,
             input_local_dim,
@@ -239,12 +258,12 @@ class MiMoV2ASRForCausalLM(nn.Module):
     def apply_input_local_transformer(self, speech_embeddings: torch.Tensor) -> torch.Tensor:
         """Apply MiMo's input local transformer.
 
-        The real transformer port is a later phase.  Keeping this as a separate
-        hook makes the current embedding/downcast path testable and easy to
-        replace with the official module.
+        The wrapper is identity until the official input-local transformer is
+        ported, but tests and future code can replace ``self.input_local_transformer``
+        without changing the prefill projection flow.
         """
 
-        return speech_embeddings
+        return self.input_local_transformer(speech_embeddings)
 
     def project_grouped_audio_embeds(self, speech_embeddings: torch.Tensor) -> torch.Tensor:
         """Project grouped speech embeddings to text hidden size."""
@@ -426,6 +445,73 @@ class MiMoV2ASRForCausalLM(nn.Module):
             return token_embeds
         return self.merge_audio_embeds_into_token_embeds(token_embeds, items)
 
+    def prepare_prefill_inputs_embeds(
+        self,
+        input_ids: torch.Tensor,
+        items: list[Any] | None = None,
+    ) -> torch.Tensor:
+        """Prepare text/audio ``inputs_embeds`` for the language backbone."""
+
+        safe_input_ids = self._restore_placeholder_ids_for_embedding(input_ids, items)
+        return self.embed_input_ids(
+            safe_input_ids,
+            self._get_token_embedding_module(),
+            items,
+        )
+
+    def _restore_placeholder_ids_for_embedding(
+        self,
+        input_ids: torch.Tensor,
+        items: list[Any] | None,
+    ) -> torch.Tensor:
+        if not items:
+            return input_ids
+        safe_input_ids = input_ids.clone()
+        for item in items:
+            for position in self._positions_from_offsets(
+                list(getattr(item, "offsets", None) or [])
+            ):
+                if position < 0 or position >= int(safe_input_ids.shape[0]):
+                    raise ValueError(
+                        f"MiMo-ASR offset position {position} is outside "
+                        f"input length {safe_input_ids.shape[0]}"
+                    )
+                safe_input_ids[position] = int(self.config.empty_token_id)
+        return safe_input_ids
+
+    def _get_token_embedding_module(self) -> nn.Module:
+        language_model = self.build_language_model()
+        get_input_embeddings = getattr(language_model, "get_input_embeddings", None)
+        if callable(get_input_embeddings):
+            return get_input_embeddings()
+        for attr_path in (
+            ("model", "embed_tokens"),
+            ("language_model", "embed_tokens"),
+            ("embed_tokens",),
+        ):
+            module: Any = language_model
+            for attr in attr_path:
+                module = getattr(module, attr, None)
+                if module is None:
+                    break
+            if isinstance(module, nn.Module):
+                return module
+        raise AttributeError("MiMo-ASR language model does not expose token embeddings")
+
+    @staticmethod
+    def _extract_mm_items_from_forward_batch(forward_batch: Any) -> list[Any]:
+        for attr in ("multimodal_inputs", "mm_inputs"):
+            mm_inputs = getattr(forward_batch, attr, None)
+            if mm_inputs is not None:
+                return list(getattr(mm_inputs, "mm_items", None) or [])
+        batch = getattr(forward_batch, "batch", None)
+        if batch is not None:
+            for attr in ("multimodal_inputs", "mm_inputs"):
+                mm_inputs = getattr(batch, attr, None)
+                if mm_inputs is not None:
+                    return list(getattr(mm_inputs, "mm_items", None) or [])
+        return []
+
     @staticmethod
     def _ensure_item_pad_value(item: Any) -> None:
         if getattr(item, "pad_value", None) is not None:
@@ -458,8 +544,36 @@ class MiMoV2ASRForCausalLM(nn.Module):
         item.offsets = [(positions[0], positions[-1])]
 
 
-    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-        raise NotImplementedError("MiMo-ASR forward/decode is not implemented yet")
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        language_model = self.build_language_model()
+        inputs_embeds = kwargs.pop("inputs_embeds", None)
+        mm_items = kwargs.pop("mimo_mm_items", None)
+        if inputs_embeds is None:
+            if mm_items is None:
+                mm_items = self._extract_mm_items_from_forward_batch(forward_batch)
+            if mm_items:
+                inputs_embeds = self.prepare_prefill_inputs_embeds(input_ids, mm_items)
+
+        if inputs_embeds is None:
+            return language_model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                **kwargs,
+            )
+        return language_model(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load currently implemented MiMo-ASR weights.
@@ -526,6 +640,7 @@ EntryClass = MiMoV2ASRForCausalLM
 
 __all__ = [
     "MiMoV2ASRForCausalLM",
+    "MiMoInputLocalTransformer",
     "group_mimo_audio_codes",
     "normalize_mimo_audio_codes",
     "pad_mimo_audio_codes_to_group",
