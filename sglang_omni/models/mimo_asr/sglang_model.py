@@ -385,7 +385,7 @@ class MiMoV2ASRForCausalLM(nn.Module):
         """Scatter encoded audio embeddings into token embeddings.
 
         This is the prefill merge primitive used before calling the text
-        backbone with ``inputs_embeds``.  It expects item offsets to be inclusive
+        backbone with ``input_embeds``.  It expects item offsets to be inclusive
         and already aligned with hidden groups.
         """
 
@@ -450,7 +450,7 @@ class MiMoV2ASRForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         items: list[Any] | None = None,
     ) -> torch.Tensor:
-        """Prepare text/audio ``inputs_embeds`` for the language backbone."""
+        """Prepare text/audio ``input_embeds`` for the language backbone."""
 
         token_embedding = self._get_token_embedding_module()
         safe_input_ids = self._restore_placeholder_ids_for_embedding(
@@ -569,15 +569,17 @@ class MiMoV2ASRForCausalLM(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         language_model = self.build_language_model()
-        inputs_embeds = kwargs.pop("inputs_embeds", None)
+        input_embeds = kwargs.pop("input_embeds", None)
+        if input_embeds is None:
+            input_embeds = kwargs.pop("inputs_embeds", None)
         mm_items = kwargs.pop("mimo_mm_items", None)
-        if inputs_embeds is None:
+        if input_embeds is None:
             if mm_items is None:
                 mm_items = self._extract_mm_items_from_forward_batch(forward_batch)
             if mm_items:
-                inputs_embeds = self.prepare_prefill_inputs_embeds(input_ids, mm_items)
+                input_embeds = self.prepare_prefill_inputs_embeds(input_ids, mm_items)
 
-        if inputs_embeds is None:
+        if input_embeds is None:
             return language_model(
                 input_ids=input_ids,
                 positions=positions,
@@ -588,7 +590,7 @@ class MiMoV2ASRForCausalLM(nn.Module):
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             **kwargs,
         )
 

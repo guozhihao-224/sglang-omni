@@ -695,8 +695,8 @@ class _FakeLanguageModel(torch.nn.Module):
 
     def forward(self, **kwargs):
         self.calls.append(kwargs)
-        if kwargs.get("inputs_embeds") is not None:
-            return kwargs["inputs_embeds"]
+        if kwargs.get("input_embeds") is not None:
+            return kwargs["input_embeds"]
         return self.embedding(kwargs["input_ids"])
 
 
@@ -738,10 +738,10 @@ def test_mimo_model_forward_without_audio_calls_language_model_with_input_ids() 
     assert language_model.calls[-1]["input_ids"] is input_ids
     assert language_model.calls[-1]["positions"] is positions
     assert language_model.calls[-1]["forward_batch"] is forward_batch
-    assert "inputs_embeds" not in language_model.calls[-1]
+    assert "input_embeds" not in language_model.calls[-1]
 
 
-def test_mimo_model_forward_with_audio_items_calls_language_model_with_inputs_embeds() -> None:
+def test_mimo_model_forward_with_audio_items_calls_language_model_with_input_embeds() -> None:
     model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
     language_model = _fake_language_model(hidden_size=1)
     model.language_model = language_model
@@ -756,14 +756,31 @@ def test_mimo_model_forward_with_audio_items_calls_language_model_with_inputs_em
     output = model.forward(torch.tensor([5, -1, 6]), torch.tensor([0, 1, 2]), forward_batch)
 
     assert torch.equal(output, torch.tensor([[5.0], [12.0], [6.0]]))
-    assert torch.equal(language_model.calls[-1]["inputs_embeds"], output)
+    assert torch.equal(language_model.calls[-1]["input_embeds"], output)
 
 
-def test_mimo_model_forward_accepts_explicit_inputs_embeds() -> None:
+def test_mimo_model_forward_accepts_explicit_input_embeds() -> None:
     model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
     language_model = _fake_language_model(hidden_size=1)
     model.language_model = language_model
-    inputs_embeds = torch.tensor([[9.0], [8.0]])
+    input_embeds = torch.tensor([[9.0], [8.0]])
+
+    output = model.forward(
+        torch.tensor([1, 2]),
+        torch.tensor([0, 1]),
+        SimpleNamespace(),
+        input_embeds=input_embeds,
+    )
+
+    assert output is input_embeds
+    assert language_model.calls[-1]["input_embeds"] is input_embeds
+
+
+def test_mimo_model_forward_accepts_hf_inputs_embeds_alias() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+    language_model = _fake_language_model(hidden_size=1)
+    model.language_model = language_model
+    inputs_embeds = torch.tensor([[7.0], [6.0]])
 
     output = model.forward(
         torch.tensor([1, 2]),
@@ -773,4 +790,5 @@ def test_mimo_model_forward_accepts_explicit_inputs_embeds() -> None:
     )
 
     assert output is inputs_embeds
-    assert language_model.calls[-1]["inputs_embeds"] is inputs_embeds
+    assert language_model.calls[-1]["input_embeds"] is inputs_embeds
+    assert "inputs_embeds" not in language_model.calls[-1]
