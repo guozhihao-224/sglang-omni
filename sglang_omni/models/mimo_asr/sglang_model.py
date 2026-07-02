@@ -16,6 +16,115 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from .configuration_mimo_asr import MiMoV2ASRConfig
 
 
+def validate_mimo_speech_config(config: MiMoV2ASRConfig) -> None:
+    """Validate MiMo audio-code channel metadata."""
+
+    if int(config.audio_channels) < 1:
+        raise ValueError(f"audio_channels must be >= 1, got {config.audio_channels}")
+    if int(config.group_size) < 1:
+        raise ValueError(f"group_size must be >= 1, got {config.group_size}")
+
+    speech_vocab_sizes = config.speech_vocab_sizes
+    speech_zeroemb_indices = config.speech_zeroemb_indices
+    delay_pattern_values = config.delay_pattern_values
+    audio_channels = int(config.audio_channels)
+
+    if len(speech_vocab_sizes) != audio_channels:
+        raise ValueError(
+            "speech_vocab_size channel count must match audio_channels "
+            f"({len(speech_vocab_sizes)} != {audio_channels})"
+        )
+    if len(speech_zeroemb_indices) != audio_channels:
+        raise ValueError(
+            "speech_zeroemb_idx channel count must match audio_channels "
+            f"({len(speech_zeroemb_indices)} != {audio_channels})"
+        )
+    if len(delay_pattern_values) != audio_channels:
+        raise ValueError(
+            "delay_pattern channel count must match audio_channels "
+            f"({len(delay_pattern_values)} != {audio_channels})"
+        )
+
+    for channel, (vocab_size, zeroemb_idx) in enumerate(
+        zip(speech_vocab_sizes, speech_zeroemb_indices, strict=True)
+    ):
+        if vocab_size < 1:
+            raise ValueError(
+                f"speech vocab size for channel {channel} must be >= 1, got {vocab_size}"
+            )
+        if zeroemb_idx < 0 or zeroemb_idx >= vocab_size:
+            raise ValueError(
+                f"speech zeroemb index for channel {channel} must be in "
+                f"[0, {vocab_size}), got {zeroemb_idx}"
+            )
+
+
+def normalize_mimo_audio_codes(
+    codes: Any,
+    *,
+    audio_channels: int = 8,
+) -> torch.Tensor:
+    """Normalize audio codes to contiguous ``[frames, channels]`` int64."""
+
+    audio_codes = torch.as_tensor(codes, dtype=torch.long)
+    if audio_codes.ndim == 3 and audio_codes.shape[0] == 1:
+        audio_codes = audio_codes.squeeze(0)
+    if audio_codes.ndim != 2:
+        raise ValueError(
+            f"MiMo audio codes must be 2-D, got shape {tuple(audio_codes.shape)}"
+        )
+    if audio_codes.shape[1] == audio_channels:
+        return audio_codes.contiguous()
+    if audio_codes.shape[0] == audio_channels:
+        return audio_codes.transpose(0, 1).contiguous()
+    raise ValueError(
+        "MiMo audio codes must have audio_channels in shape [T, C] or [C, T], "
+        f"got {tuple(audio_codes.shape)} with audio_channels={audio_channels}"
+    )
+
+
+def pad_mimo_audio_codes_to_group(
+    codes: torch.Tensor,
+    *,
+    group_size: int,
+) -> torch.Tensor:
+    """Pad ``[frames, channels]`` codes by repeating the last frame."""
+
+    if group_size < 1:
+        raise ValueError(f"group_size must be >= 1, got {group_size}")
+    if codes.ndim != 2:
+        raise ValueError(f"MiMo audio codes must be 2-D, got shape {tuple(codes.shape)}")
+    num_frames = int(codes.shape[0])
+    if num_frames < 1:
+        raise ValueError("MiMo audio codes must contain at least one frame")
+    remainder = num_frames % group_size
+    if remainder == 0:
+        return codes.contiguous()
+    pad_frames = group_size - remainder
+    return torch.cat([codes, codes[-1:].expand(pad_frames, -1)], dim=0).contiguous()
+
+
+def group_mimo_audio_codes(
+    codes: Any,
+    *,
+    audio_channels: int = 8,
+    group_size: int = 4,
+) -> torch.Tensor:
+    """Return grouped codes as ``[groups, channels, group_size]``."""
+
+    normalized_codes = normalize_mimo_audio_codes(codes, audio_channels=audio_channels)
+    padded_codes = pad_mimo_audio_codes_to_group(
+        normalized_codes,
+        group_size=group_size,
+    )
+    num_groups = int(padded_codes.shape[0]) // group_size
+    return (
+        padded_codes.reshape(num_groups, group_size, audio_channels)
+        .transpose(1, 2)
+        .contiguous()
+    )
+
+
 class MiMoV2ASRForCausalLM(nn.Module):
     """Placeholder for the native MiMo-ASR SGLang model implementation."""
 
@@ -26,9 +135,34 @@ class MiMoV2ASRForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        validate_mimo_speech_config(config)
         self.config = config
         self.quant_config = quant_config
         self.prefix = prefix
+        self.audio_channels = int(config.audio_channels)
+        self.group_size = int(config.group_size)
+        self.speech_vocab_sizes = list(config.speech_vocab_sizes)
+        self.speech_zeroemb_indices = list(config.speech_zeroemb_indices)
+        self.delay_pattern_values = list(config.delay_pattern_values)
+
+        input_local_dim = int(config.input_local_dim)
+        hidden_size = int(config.hidden_size)
+        self.speech_embeddings = nn.ModuleList(
+            nn.Embedding(
+                vocab_size,
+                input_local_dim,
+                padding_idx=zeroemb_idx,
+            )
+            for vocab_size, zeroemb_idx in zip(
+                self.speech_vocab_sizes,
+                self.speech_zeroemb_indices,
+                strict=True,
+            )
+        )
+        self.speech_group_downcast = nn.Linear(
+            self.group_size * input_local_dim,
+            hidden_size,
+        )
 
     def pad_input_ids(self, input_ids: list[int], mm_inputs: Any):
         raise NotImplementedError("MiMo-ASR pad_input_ids is not implemented yet")
@@ -43,4 +177,10 @@ class MiMoV2ASRForCausalLM(nn.Module):
 EntryClass = MiMoV2ASRForCausalLM
 
 
-__all__ = ["MiMoV2ASRForCausalLM"]
+__all__ = [
+    "MiMoV2ASRForCausalLM",
+    "group_mimo_audio_codes",
+    "normalize_mimo_audio_codes",
+    "pad_mimo_audio_codes_to_group",
+    "validate_mimo_speech_config",
+]
