@@ -124,6 +124,12 @@ class MiMoASROutputProcessor:
     group to KV/request state.
     """
 
+    def __init__(self) -> None:
+        # ModelRunner._build_forward_batch reads these flags when no custom
+        # capture mode is requested (see sglang_omni/model_runner/base.py).
+        self._capture_hidden = False
+        self._capture_hidden_layers = None
+
     def process(
         self,
         model_output: Any,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
 from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
@@ -742,6 +743,13 @@ def test_mimo_decode_groups_helper_validates_shapes() -> None:
         raise AssertionError("bad hidden batch size should fail")
 
 
+def test_mimo_asr_output_processor_exposes_capture_hidden_flag() -> None:
+    processor = MiMoASROutputProcessor()
+
+    assert processor._capture_hidden is False
+    assert processor._capture_hidden_layers is None
+
+
 def test_mimo_asr_output_processor_preserves_grouped_ids() -> None:
     processor = MiMoASROutputProcessor()
     model_output = SimpleNamespace(
@@ -762,6 +770,37 @@ def test_mimo_asr_output_processor_preserves_grouped_ids() -> None:
     assert outputs["r1"].data == [4, 5, 6]
     assert outputs["r0"].finished is False
     assert outputs["r1"].finished is True
+
+
+def test_mimo_model_forward_passes_through_language_model_logits_output() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=2))
+    model.return_hidden_states_output = True
+
+    class _FakeLanguageModelWithLogits(torch.nn.Module):
+        def forward(self, **kwargs):
+            hidden_states = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+            next_token_logits = torch.tensor(
+                [[10.0, 11.0, 12.0], [20.0, 21.0, 22.0]]
+            )
+            return LogitsProcessorOutput(
+                next_token_logits=next_token_logits,
+                hidden_states=hidden_states,
+            )
+
+    model.language_model = _FakeLanguageModelWithLogits()
+
+    output = model.forward(
+        torch.tensor([1, 2]),
+        torch.tensor([0, 1]),
+        SimpleNamespace(),
+    )
+
+    assert isinstance(output, LogitsProcessorOutput)
+    assert torch.equal(
+        output.next_token_logits,
+        torch.tensor([[10.0, 11.0, 12.0], [20.0, 21.0, 22.0]]),
+    )
+    assert torch.equal(output.hidden_states, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
 
 
 def test_mimo_runner_post_decode_preserves_scheduler_text_ids() -> None:
@@ -1249,7 +1288,7 @@ def test_mimo_model_build_language_model_is_lazy_and_cached(monkeypatch) -> None
 
 def test_route_mimo_weight_name_classifies_checkpoint_prefixes() -> None:
     assert route_mimo_weight_name("model.layers.0.self_attn.q_proj.weight") == "language_model"
-    assert route_mimo_weight_name("lm_head.weight") == "direct"
+    assert route_mimo_weight_name("lm_head.weight") == "language_model"
     assert route_mimo_weight_name("speech_embeddings.0.weight") == "direct"
     assert route_mimo_weight_name("speech_group_downcast.weight") == "direct"
     assert route_mimo_weight_name("input_local_transformer.layers.0.weight") == "pending_mimo"

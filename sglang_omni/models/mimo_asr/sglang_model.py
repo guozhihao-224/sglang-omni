@@ -876,7 +876,7 @@ class MiMoV2ASRForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: Any,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | LogitsProcessorOutput:
         language_model = self.build_language_model()
         input_embeds = kwargs.pop("input_embeds", None)
         if input_embeds is None:
@@ -888,26 +888,96 @@ class MiMoV2ASRForCausalLM(nn.Module):
             if mm_items:
                 input_embeds = self.prepare_prefill_inputs_embeds(input_ids, mm_items)
 
-        if input_embeds is None:
-            hidden_states = language_model(
-                input_ids=input_ids,
-                positions=positions,
-                forward_batch=forward_batch,
-                **kwargs,
-            )
-        else:
-            hidden_states = language_model(
-                input_ids=input_ids,
-                positions=positions,
-                forward_batch=forward_batch,
-                input_embeds=input_embeds,
-                **kwargs,
-            )
+        lm_kwargs = dict(kwargs)
+        if input_embeds is not None:
+            lm_kwargs["input_embeds"] = input_embeds
+        lm_output = language_model(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            **lm_kwargs,
+        )
         if not self.return_hidden_states_output:
-            return hidden_states
+            return lm_output
+        return self._finalize_forward_logits_output(
+            lm_output,
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+        )
+
+    def _finalize_forward_logits_output(
+        self,
+        lm_output: torch.Tensor | LogitsProcessorOutput,
+        *,
+        input_ids: torch.Tensor,
+        forward_batch: Any,
+    ) -> LogitsProcessorOutput:
+        """Return real text logits plus hidden states for MiMo decode hooks."""
+
+        if isinstance(lm_output, LogitsProcessorOutput):
+            return lm_output
+
+        hidden_states = lm_output
+        sample_hidden_states = self._select_sample_hidden_states(
+            hidden_states,
+            forward_batch,
+        )
+        next_token_logits = self._compute_text_logits(
+            sample_hidden_states,
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+        )
         return LogitsProcessorOutput(
-            next_token_logits=hidden_states.new_empty((hidden_states.shape[0], 1)),
-            hidden_states=hidden_states,
+            next_token_logits=next_token_logits,
+            hidden_states=sample_hidden_states,
+        )
+
+    def _select_sample_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Any,
+    ) -> torch.Tensor:
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        is_extend = (
+            forward_mode is not None
+            and hasattr(forward_mode, "is_extend")
+            and bool(forward_mode.is_extend())
+        )
+        if not is_extend:
+            return hidden_states
+        last_index = self._extend_last_index(forward_batch, hidden_states.device)
+        return hidden_states[last_index]
+
+    @staticmethod
+    def _extend_last_index(forward_batch: Any, device: torch.device) -> torch.Tensor:
+        extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+        if extend_seq_lens is None:
+            return torch.tensor(
+                [max(int(forward_batch.input_ids.shape[0]) - 1, 0)],
+                device=device,
+            )
+        return torch.cumsum(extend_seq_lens.to(device=device), dim=0) - 1
+
+    def _compute_text_logits(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        input_ids: torch.Tensor,
+        forward_batch: Any,
+    ) -> torch.Tensor:
+        language_model = self.build_language_model()
+        logits_processor = getattr(language_model, "logits_processor", None)
+        lm_head = getattr(language_model, "lm_head", None)
+        if logits_processor is None or lm_head is None:
+            raise RuntimeError(
+                "MiMo-ASR requires the language model to expose logits_processor "
+                "and lm_head when return_hidden_states_output is enabled"
+            )
+        return logits_processor(
+            input_ids,
+            hidden_states,
+            lm_head,
+            forward_batch,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -1000,6 +1070,8 @@ def route_mimo_weight_name(name: str) -> str:
     """Classify MiMo checkpoint weights for staged loading."""
 
     if name.startswith(_LANGUAGE_MODEL_PREFIX):
+        return "language_model"
+    if name.startswith("lm_head."):
         return "language_model"
     if name.startswith(_SUPPORTED_DIRECT_PREFIXES):
         return "direct"
