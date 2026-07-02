@@ -48,30 +48,14 @@ class MiMoAudioTokenizerAdapter:
     def _load_backend(self) -> Any:
         """Load the real tokenizer backend lazily.
 
-        Supported import paths intentionally cover the public vLLM-Omni layout
-        and the likely standalone MiMo package layout.  If neither is installed,
-        fail with an actionable error instead of at module import time.
+        This intentionally does not import or reuse vLLM-Omni's tokenizer
+        worker.  SGLang-Omni owns the audio-tokenizer preprocessing path here
+        and only depends on the official MiMo tokenizer package at runtime.
         """
 
         import importlib
 
-        worker_candidates = (
-            "mimo_audio.mimo_audio_code2wav",
-            "vllm_omni.model_executor.models.mimo_audio.mimo_audio_code2wav",
-        )
         last_error: BaseException | None = None
-        for module_name in worker_candidates:
-            try:
-                module = importlib.import_module(module_name)
-                get_tokenizer_worker = getattr(module, "get_tokenizer_worker")
-                self._backend = get_tokenizer_worker(
-                    device=self.device,
-                    config_path=self.audio_tokenizer_path,
-                    audio_tokenizer_path=self.audio_tokenizer_path,
-                )
-                return self._backend
-            except Exception as exc:  # pragma: no cover - environment dependent
-                last_error = exc
         try:
             _install_flash_attn_varlen_compat()
             module = importlib.import_module("mimo_audio_tokenizer")
@@ -80,13 +64,14 @@ class MiMoAudioTokenizerAdapter:
                 tokenizer_cls=tokenizer_cls,
                 audio_tokenizer_path=self.audio_tokenizer_path,
                 device=self.device,
+                audio_channels=MIMO_ASR_AUDIO_CHANNELS,
             )
             return self._backend
         except Exception as exc:  # pragma: no cover - environment dependent
             last_error = exc
         raise RuntimeError(
             "Unable to load MiMo audio tokenizer backend. Install the official "
-            "MiMo audio tokenizer package or vLLM-Omni, and set "
+            "MiMo audio tokenizer package, and set "
             "audio_tokenizer_path to XiaomiMiMo/MiMo-Audio-Tokenizer or a local path."
         ) from last_error
 
@@ -160,14 +145,24 @@ class _OfficialMiMoAudioTokenizerBackend:
         tokenizer_cls: Any,
         audio_tokenizer_path: str,
         device: str,
+        audio_channels: int,
     ) -> None:
         self.device = torch.device(device)
+        self.audio_channels = int(audio_channels)
         self.tokenizer = tokenizer_cls.from_pretrained(audio_tokenizer_path)
-        self.tokenizer.eval().bfloat16().to(self.device)
+        self.tokenizer.eval().to(self.device)
+        if self.device.type != "cpu":
+            self.tokenizer.bfloat16()
         self.config = self.tokenizer.config
         self._mel_transform = None
 
-    def encode(self, *, audio: tuple[torch.Tensor, int]) -> torch.Tensor:
+    @torch.inference_mode()
+    def encode(
+        self,
+        *,
+        audio: tuple[torch.Tensor, int],
+        max_length: int = 256000,
+    ) -> torch.Tensor:
         waveform, sample_rate = audio
         waveform = waveform.to(device=self.device, dtype=torch.float32)
         if int(sample_rate) != int(self.config.sampling_rate):
@@ -182,28 +177,24 @@ class _OfficialMiMoAudioTokenizerBackend:
                 int(sample_rate),
                 int(self.config.sampling_rate),
             )
-        return self._encode_waveform(waveform).transpose(0, 1).detach().cpu()
-
-    def _encode_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
-        target_sr = int(self.config.sampling_rate)
-        chunk_samples = 30 * target_sr
-        n_fft = int(self.config.nfft)
-        total_samples = int(waveform.shape[-1])
-        code_parts: list[torch.Tensor] = []
-        start = 0
-        while start < total_samples:
-            end = min(start + chunk_samples, total_samples)
-            if 0 < total_samples - end < n_fft:
-                end = total_samples
-            chunk = waveform[start:end]
-            if int(chunk.shape[-1]) < n_fft:
-                chunk = torch.nn.functional.pad(chunk, (0, n_fft - int(chunk.shape[-1])))
-            mel = self._wav_to_mel(chunk).transpose(0, 1)
-            code_parts.append(self._encode_features(mel, torch.tensor([mel.size(0)])))
-            start = end
-        if not code_parts:
+        if int(waveform.shape[-1]) == 0:
             raise ValueError("MiMo audio tokenizer received empty waveform")
-        return torch.cat(code_parts, dim=-1)
+
+        mel = self._wav_to_mel(waveform).transpose(0, 1)
+        input_len = int(mel.size(0))
+        segment_size = 6000
+        input_len_segments = [segment_size] * (input_len // segment_size)
+        if input_len % segment_size > 0:
+            input_len_segments.append(input_len % segment_size)
+        if not input_len_segments:
+            raise ValueError("MiMo audio tokenizer produced empty mel features")
+
+        input_lens = torch.tensor(input_len_segments, device=self.device)
+        feature_groups, len_groups = self._group_by_length(mel, input_lens, max_length)
+        codes_packed = self._encode_feature_groups(feature_groups, len_groups)
+        codes = codes_packed.transpose(0, 1).detach()
+        audio_codes = codes[:, : self.audio_channels]
+        return audio_codes.transpose(0, 1).detach().cpu()
 
     def _wav_to_mel(self, waveform: torch.Tensor) -> torch.Tensor:
         if self._mel_transform is None:
@@ -223,18 +214,54 @@ class _OfficialMiMoAudioTokenizerBackend:
         spec = self._mel_transform(waveform[None, :])
         return torch.log(torch.clip(spec, min=1e-7)).squeeze()
 
-    def _encode_features(
+    @staticmethod
+    def _group_by_length(
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+        max_length: int,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        if features.size(0) != lengths.sum().item():
+            raise ValueError(
+                f"Feature size mismatch: {features.size(0)} vs {lengths.sum().item()}"
+            )
+
+        split_points: list[int] = []
+        current_sum = 0
+        for idx, seq_len in enumerate(lengths):
+            seq_len_int = int(seq_len.item())
+            if current_sum + seq_len_int > max_length and current_sum > 0:
+                split_points.append(idx)
+                current_sum = seq_len_int
+            else:
+                current_sum += seq_len_int
+
+        group_sizes: list[int] = []
+        prev = 0
+        for point in split_points:
+            group_sizes.append(point - prev)
+            prev = point
+        if prev < len(lengths):
+            group_sizes.append(len(lengths) - prev)
+
+        len_groups = torch.split(lengths, group_sizes)
+        feature_sizes = [int(group.sum().item()) for group in len_groups]
+        feature_groups = torch.split(features, feature_sizes)
+        return feature_groups, len_groups
+
+    def _encode_feature_groups(
         self,
-        input_features: torch.Tensor,
-        input_lens: torch.Tensor,
+        feature_groups: tuple[torch.Tensor, ...],
+        len_groups: tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
-        with torch.no_grad():
+        encoded_parts: list[torch.Tensor] = []
+        for features, lengths in zip(feature_groups, len_groups):
             codes, _ = self.tokenizer.encoder.encode(
-                input_features=input_features.to(self.device),
-                input_lens=input_lens.to(self.device),
+                input_features=features.to(self.device),
+                input_lens=lengths.to(self.device),
                 return_codes_only=True,
             )
-        return codes
+            encoded_parts.append(codes)
+        return torch.cat(encoded_parts, dim=1)
 
 
 def _as_float_tensor(audio: Any) -> torch.Tensor:
