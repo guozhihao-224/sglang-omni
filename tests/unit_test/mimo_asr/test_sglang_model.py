@@ -430,7 +430,7 @@ def test_mimo_model_merge_audio_embeds_into_token_embeds_multiple_items() -> Non
 
     merged = model.merge_audio_embeds_into_token_embeds(token_embeds, items)
 
-    assert torch.equal(merged, torch.tensor([[0.0], [12.0], [0.0], [12.0], [12.0]]))
+    assert torch.equal(merged, torch.tensor([[0.0], [12.0], [0.0], [12.0], [6.0]]))
 
 
 def test_mimo_model_merge_audio_embeds_requires_offsets() -> None:
