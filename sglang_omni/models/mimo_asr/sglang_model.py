@@ -164,6 +164,68 @@ class MiMoV2ASRForCausalLM(nn.Module):
             hidden_size,
         )
 
+    def embed_grouped_audio_codes(self, codes: Any) -> torch.Tensor:
+        """Embed MiMo audio codes as ``[groups, group_size, input_local_dim]``.
+
+        This covers the deterministic front half of official prefill embedding:
+        normalize/group code frames, lookup one embedding table per RVQ channel,
+        mask each channel's zeroemb/padding token, then sum channels.
+        """
+
+        grouped_codes = group_mimo_audio_codes(
+            codes,
+            audio_channels=self.audio_channels,
+            group_size=self.group_size,
+        ).to(next(self.speech_embeddings.parameters()).device)
+        embeddings: torch.Tensor | None = None
+        for channel_idx, embedding in enumerate(self.speech_embeddings):
+            channel_codes = grouped_codes[:, channel_idx, :]
+            channel_embeddings = embedding(channel_codes)
+            zeroemb_idx = self.speech_zeroemb_indices[channel_idx]
+            channel_embeddings = channel_embeddings.masked_fill(
+                (channel_codes == zeroemb_idx).unsqueeze(-1),
+                0.0,
+            )
+            embeddings = (
+                channel_embeddings
+                if embeddings is None
+                else embeddings + channel_embeddings
+            )
+        assert embeddings is not None
+        return embeddings
+
+    def apply_input_local_transformer(self, speech_embeddings: torch.Tensor) -> torch.Tensor:
+        """Apply MiMo's input local transformer.
+
+        The real transformer port is a later phase.  Keeping this as a separate
+        hook makes the current embedding/downcast path testable and easy to
+        replace with the official module.
+        """
+
+        return speech_embeddings
+
+    def project_grouped_audio_embeds(self, speech_embeddings: torch.Tensor) -> torch.Tensor:
+        """Project grouped speech embeddings to text hidden size."""
+
+        if speech_embeddings.ndim != 3:
+            raise ValueError(
+                "speech_embeddings must be [groups, group_size, dim], got "
+                f"shape {tuple(speech_embeddings.shape)}"
+            )
+        if speech_embeddings.shape[1] != self.group_size:
+            raise ValueError(
+                f"speech group dimension must be {self.group_size}, got "
+                f"{speech_embeddings.shape[1]}"
+            )
+        transformed = self.apply_input_local_transformer(speech_embeddings)
+        flattened = transformed.reshape(transformed.shape[0], -1)
+        return self.speech_group_downcast(flattened)
+
+    def encode_audio_codes_to_hidden(self, codes: Any) -> torch.Tensor:
+        """Encode MiMo audio codes into ``[groups, hidden_size]`` embeddings."""
+
+        return self.project_grouped_audio_embeds(self.embed_grouped_audio_codes(codes))
+
     def pad_input_ids(self, input_ids: list[int], mm_inputs: Any):
         raise NotImplementedError("MiMo-ASR pad_input_ids is not implemented yet")
 

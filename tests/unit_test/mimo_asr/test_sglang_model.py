@@ -113,3 +113,98 @@ def test_mimo_sglang_model_initializes_speech_embedding_modules() -> None:
     assert model.speech_embeddings[1].padding_idx == 5
     assert model.speech_group_downcast.in_features == 6
     assert model.speech_group_downcast.out_features == 7
+
+
+def test_mimo_model_embeds_grouped_audio_codes_with_zeroemb_mask() -> None:
+    config = _tiny_config(hidden_size=2)
+    model = MiMoV2ASRForCausalLM(config)
+    with torch.no_grad():
+        model.speech_embeddings[0].weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                    [3.0, 0.0, 0.0],
+                    [4.0, 0.0, 0.0],
+                    [99.0, 99.0, 99.0],
+                ]
+            )
+        )
+        model.speech_embeddings[1].weight.copy_(
+            torch.tensor(
+                [
+                    [0.0, 10.0, 0.0],
+                    [0.0, 20.0, 0.0],
+                    [0.0, 30.0, 0.0],
+                    [0.0, 40.0, 0.0],
+                    [0.0, 50.0, 0.0],
+                    [99.0, 99.0, 99.0],
+                ]
+            )
+        )
+
+    codes = torch.tensor([[1, 2], [4, 3], [2, 5]], dtype=torch.long)
+
+    embeddings = model.embed_grouped_audio_codes(codes)
+
+    assert embeddings.shape == (2, 2, 3)
+    assert torch.equal(
+        embeddings,
+        torch.tensor(
+            [
+                [[2.0, 30.0, 0.0], [0.0, 40.0, 0.0]],
+                [[3.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+            ]
+        ),
+    )
+
+
+def test_mimo_model_projects_grouped_audio_embeds_to_hidden_size() -> None:
+    config = _tiny_config(hidden_size=2)
+    model = MiMoV2ASRForCausalLM(config)
+    with torch.no_grad():
+        model.speech_group_downcast.weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                ]
+            )
+        )
+        model.speech_group_downcast.bias.zero_()
+    embeddings = torch.tensor(
+        [
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+        ]
+    )
+
+    projected = model.project_grouped_audio_embeds(embeddings)
+
+    assert torch.equal(projected, torch.tensor([[1.0, 4.0], [7.0, 10.0]]))
+
+
+def test_mimo_model_encode_audio_codes_to_hidden_combines_embedding_and_projection() -> None:
+    config = _tiny_config(hidden_size=1)
+    model = MiMoV2ASRForCausalLM(config)
+    with torch.no_grad():
+        for embedding in model.speech_embeddings:
+            embedding.weight.fill_(1.0)
+        model.speech_group_downcast.weight.fill_(1.0)
+        model.speech_group_downcast.bias.zero_()
+
+    hidden = model.encode_audio_codes_to_hidden(torch.tensor([[0, 0], [1, 1]]))
+
+    assert hidden.shape == (1, 1)
+    assert torch.equal(hidden, torch.tensor([[12.0]]))
+
+
+def test_mimo_model_project_grouped_audio_embeds_validates_shape() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+
+    try:
+        model.project_grouped_audio_embeds(torch.zeros(2, 3, 3))
+    except ValueError as exc:
+        assert "speech group dimension" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad group dimension should fail")
