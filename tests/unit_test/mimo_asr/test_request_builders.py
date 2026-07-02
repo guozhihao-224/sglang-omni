@@ -19,6 +19,7 @@ from sglang_omni.models.mimo_asr.prompt import (
 )
 from sglang_omni.models.mimo_asr.request_builders import (
     MiMoASRRequestData,
+    _extract_text_channel,
     make_mimo_asr_scheduler_adapters,
 )
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -170,7 +171,18 @@ def test_mimo_result_adapter_extracts_text_channel_and_strips_specials() -> None
         data={},
     )
     data = MiMoASRRequestData(
-        output_ids=[20, 1000, 1001, 1002, 30, 1003, 1004, 1005, 21, 1006, 1007, 1008, 31, 1009, 1010, 1011, 99],
+        output_ids=[
+            20,
+            *range(1000, 1035),
+            30,
+            *range(2000, 2035),
+            21,
+            *range(3000, 3035),
+            31,
+            *range(4000, 4035),
+            99,
+            *range(5000, 5035),
+        ],
         stage_payload=payload,
         language="zh",
         audio_tag=MIMO_AUDIO_TAG_CHINESE,
@@ -186,3 +198,11 @@ def test_mimo_result_adapter_extracts_text_channel_and_strips_specials() -> None
         "skip_special_tokens": True,
         "clean_up_tokenization_spaces": False,
     }
+
+
+def test_mimo_extract_text_channel_keeps_legacy_stride_fallback() -> None:
+    assert _extract_text_channel(
+        [20, 1000, 1001, 1002, 21, 1003, 1004, 1005],
+        group_size=4,
+        audio_channels=8,
+    ) == [20, 21]

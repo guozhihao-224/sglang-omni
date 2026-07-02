@@ -30,7 +30,11 @@ from .prompt import (
     resolve_audio_tag,
     strip_mimo_asr_special_text,
 )
-from .tool_funcs.audio_lengths import MIMO_ASR_GROUP_SIZE, mimo_asr_num_empty_tokens
+from .tool_funcs.audio_lengths import (
+    MIMO_ASR_AUDIO_CHANNELS,
+    MIMO_ASR_GROUP_SIZE,
+    mimo_asr_num_empty_tokens,
+)
 
 _SAMPLE_RATE = 24000
 
@@ -121,13 +125,25 @@ def _to_code_tensor(codes: Any) -> torch.Tensor:
     else:
         tensor = torch.tensor(codes, dtype=torch.long)
     if tensor.ndim != 2:
-        raise ValueError(f"MiMo-ASR audio codes must be [T, C], got {tuple(tensor.shape)}")
+        raise ValueError(
+            f"MiMo-ASR audio codes must be [T, C], got {tuple(tensor.shape)}"
+        )
     return tensor
 
 
-def _extract_text_channel(output_ids: list[int], group_size: int) -> list[int]:
+def _extract_text_channel(
+    output_ids: list[int],
+    group_size: int,
+    audio_channels: int = MIMO_ASR_AUDIO_CHANNELS,
+) -> list[int]:
     if group_size <= 1:
         return list(output_ids)
+    flat_group_size = (int(audio_channels) + 1) * int(group_size)
+    if flat_group_size > 0 and len(output_ids) % flat_group_size == 0:
+        return [
+            output_ids[idx]
+            for idx in range(0, len(output_ids), flat_group_size)
+        ]
     return list(output_ids[::group_size])
 
 
@@ -227,7 +243,11 @@ def make_mimo_asr_scheduler_adapters(
     def result_adapter(data: MiMoASRRequestData) -> StagePayload:
         payload = data.stage_payload
         output_ids = list(data.output_ids or [])
-        text_ids = _extract_text_channel(output_ids, MIMO_ASR_GROUP_SIZE)
+        text_ids = _extract_text_channel(
+            output_ids,
+            MIMO_ASR_GROUP_SIZE,
+            MIMO_ASR_AUDIO_CHANNELS,
+        )
         text = strip_mimo_asr_special_text(_decode_token_ids(tokenizer, text_ids))
         engine_time_s = (
             time.perf_counter() - data.engine_start_s if data.engine_start_s else 0.0

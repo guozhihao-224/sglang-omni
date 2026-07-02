@@ -84,6 +84,45 @@ class MiMoASROutputProcessor:
         return outputs
 
 
+def commit_mimo_decode_groups_to_reqs(
+    reqs: list[Any],
+    groups: torch.Tensor,
+    stopped: torch.Tensor | list[bool] | tuple[bool, ...],
+) -> list[Any]:
+    """Append flat MiMo groups to Req.output_ids and return stopped reqs.
+
+    This intentionally does not call SGLang's ``check_finished`` because the
+    stop token is at the first text slot of a flat group, not necessarily the
+    last id appended. Scheduler integration should mark returned reqs finished
+    using the runtime's native finish-reason API.
+    """
+
+    if groups.ndim != 2:
+        raise ValueError(
+            f"groups must be [batch, group_len], got {tuple(groups.shape)}"
+        )
+    if int(groups.shape[0]) != len(reqs):
+        raise ValueError(
+            "groups batch size must match reqs "
+            f"({groups.shape[0]} != {len(reqs)})"
+        )
+    stopped_values = _stopped_to_list(stopped)
+    if len(stopped_values) != len(reqs):
+        raise ValueError(
+            "stopped length must match reqs "
+            f"({len(stopped_values)} != {len(reqs)})"
+        )
+
+    stopped_reqs: list[Any] = []
+    group_rows = groups.detach().cpu().tolist()
+    for req, group, is_stopped in zip(reqs, group_rows, stopped_values, strict=True):
+        req.output_ids.extend(int(token_id) for token_id in group)
+        if is_stopped:
+            setattr(req, "_mimo_asr_stopped", True)
+            stopped_reqs.append(req)
+    return stopped_reqs
+
+
 def build_mimo_decode_groups(
     model: Any,
     text_token_ids: torch.Tensor,
@@ -157,7 +196,14 @@ def _normalize_hidden_rows(
     return hidden_states
 
 
+def _stopped_to_list(stopped: torch.Tensor | list[bool] | tuple[bool, ...]) -> list[bool]:
+    if isinstance(stopped, torch.Tensor):
+        return [bool(value) for value in stopped.detach().cpu().tolist()]
+    return [bool(value) for value in stopped]
+
+
 __all__ = [
+    "commit_mimo_decode_groups_to_reqs",
     "MiMoASRModelRunner",
     "MiMoASROutputProcessor",
     "build_mimo_decode_groups",

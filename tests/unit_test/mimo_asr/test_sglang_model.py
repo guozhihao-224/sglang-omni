@@ -10,6 +10,7 @@ from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
 from sglang_omni.models.mimo_asr.model_runner import (
     MiMoASROutputProcessor,
     build_mimo_decode_groups,
+    commit_mimo_decode_groups_to_reqs,
 )
 from sglang_omni.models.mimo_asr.sglang_model import (
     MiMoInputLocalTransformer,
@@ -724,6 +725,40 @@ def test_mimo_asr_output_processor_preserves_grouped_ids() -> None:
     assert outputs["r0"].data == [1, 2, 3]
     assert outputs["r1"].data == [4, 5, 6]
     assert outputs["r0"].finished is False
+
+
+def test_mimo_commit_decode_groups_extends_reqs_and_returns_stopped() -> None:
+    reqs = [SimpleNamespace(output_ids=[1]), SimpleNamespace(output_ids=[])]
+    groups = torch.tensor([[10, 11, 12], [20, 21, 22]])
+
+    stopped = commit_mimo_decode_groups_to_reqs(
+        reqs,
+        groups,
+        torch.tensor([False, True]),
+    )
+
+    assert reqs[0].output_ids == [1, 10, 11, 12]
+    assert reqs[1].output_ids == [20, 21, 22]
+    assert stopped == [reqs[1]]
+    assert getattr(reqs[1], "_mimo_asr_stopped") is True
+
+
+def test_mimo_commit_decode_groups_validates_shapes() -> None:
+    reqs = [SimpleNamespace(output_ids=[])]
+
+    try:
+        commit_mimo_decode_groups_to_reqs(reqs, torch.zeros(1, 2, 3), [False])
+    except ValueError as exc:
+        assert "groups" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad groups shape should fail")
+
+    try:
+        commit_mimo_decode_groups_to_reqs(reqs, torch.zeros(2, 3), [False, False])
+    except ValueError as exc:
+        assert "batch size" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad groups batch size should fail")
 
 
 def test_mimo_model_build_decode_token_group_validates_speech_shape() -> None:
