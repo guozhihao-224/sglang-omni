@@ -503,6 +503,136 @@ def test_mimo_model_sample_local_code_ids_validates_inputs() -> None:
         raise AssertionError("bad top_p should fail")
 
 
+def test_mimo_model_build_decode_token_group_with_speech_codes() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(empty_token_id=99))
+    speech_codes = torch.tensor([[10, 20], [11, 21]])
+
+    group = model.build_decode_token_group(7, speech_codes)
+
+    assert torch.equal(group, torch.tensor([7, 10, 20, 99, 11, 21]))
+
+
+def test_mimo_model_build_decode_token_group_accepts_channel_first_codes() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(empty_token_id=99))
+    speech_codes = torch.tensor([[10, 11], [20, 21]])
+
+    group = model.build_decode_token_group(7, speech_codes)
+
+    assert torch.equal(group, torch.tensor([7, 10, 20, 99, 11, 21]))
+
+
+def test_mimo_model_build_decode_token_group_fills_zeroemb_without_speech() -> None:
+    model = MiMoV2ASRForCausalLM(
+        _tiny_config(empty_token_id=99, speech_zeroemb_idx="4-5")
+    )
+
+    group = model.build_decode_token_group(8, text_tail_token_id=0)
+
+    assert torch.equal(group, torch.tensor([8, 4, 5, 0, 4, 5]))
+
+
+def test_mimo_model_build_empty_decode_token_group_uses_local_forward() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(empty_token_id=99))
+    calls = []
+
+    def _fake_local_forward(hidden_states, **kwargs):
+        calls.append((hidden_states, kwargs))
+        return torch.tensor([[10, 20], [11, 21]])
+
+    model.local_forward = _fake_local_forward
+    hidden_states = torch.ones(1, 7)
+
+    group = model.build_empty_decode_token_group(
+        hidden_states,
+        do_sample=False,
+        text_tail_token_id=0,
+    )
+
+    assert torch.equal(group, torch.tensor([99, 10, 20, 0, 11, 21]))
+    assert calls[0][0] is hidden_states
+    assert calls[0][1]["do_sample"] is False
+
+
+def test_mimo_model_build_empty_decode_token_group_validates_local_shape() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+    model.local_forward = lambda hidden_states, **kwargs: torch.tensor([[1, 2]])
+
+    try:
+        model.build_empty_decode_token_group(torch.ones(1, 7))
+    except ValueError as exc:
+        assert "local_forward" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad local_forward shape should fail")
+
+
+def test_mimo_model_build_decode_step_regular_token_uses_zeroemb() -> None:
+    model = MiMoV2ASRForCausalLM(
+        _tiny_config(empty_token_id=99, stop_token_id=42, speech_zeroemb_idx="4-5")
+    )
+
+    group, stopped = model.build_decode_step(8, text_tail_token_id=0)
+
+    assert stopped is False
+    assert torch.equal(group, torch.tensor([8, 4, 5, 0, 4, 5]))
+
+
+def test_mimo_model_build_decode_step_empty_token_uses_local_forward() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(empty_token_id=99, stop_token_id=42))
+    calls = []
+
+    def _fake_local_forward(hidden_states, **kwargs):
+        calls.append((hidden_states, kwargs))
+        return torch.tensor([[10, 20], [11, 21]])
+
+    model.local_forward = _fake_local_forward
+    hidden_states = torch.ones(1, 7)
+
+    group, stopped = model.build_decode_step(
+        99,
+        hidden_states,
+        do_sample=False,
+        text_tail_token_id=0,
+    )
+
+    assert stopped is False
+    assert torch.equal(group, torch.tensor([99, 10, 20, 0, 11, 21]))
+    assert calls[0][0] is hidden_states
+    assert calls[0][1]["do_sample"] is False
+
+
+def test_mimo_model_build_decode_step_stop_token_marks_stopped() -> None:
+    model = MiMoV2ASRForCausalLM(
+        _tiny_config(empty_token_id=99, stop_token_id=42, speech_zeroemb_idx="4-5")
+    )
+
+    group, stopped = model.build_decode_step(42, text_tail_token_id=0)
+
+    assert stopped is True
+    assert torch.equal(group, torch.tensor([42, 4, 5, 0, 4, 5]))
+
+
+def test_mimo_model_build_decode_step_requires_hidden_for_empty() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(empty_token_id=99))
+
+    try:
+        model.build_decode_step(99)
+    except ValueError as exc:
+        assert "hidden_states" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("empty decode without hidden_states should fail")
+
+
+def test_mimo_model_build_decode_token_group_validates_speech_shape() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+
+    try:
+        model.build_decode_token_group(7, torch.zeros(3, 2, dtype=torch.long))
+    except ValueError as exc:
+        assert "speech_codes" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad speech code shape should fail")
+
+
 def test_mimo_model_get_audio_feature_uses_model_specific_audio_codes() -> None:
     config = _tiny_config(hidden_size=1)
     model = MiMoV2ASRForCausalLM(config)

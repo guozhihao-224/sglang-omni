@@ -434,6 +434,123 @@ class MiMoV2ASRForCausalLM(nn.Module):
             generator=generator,
         )
 
+    def build_decode_token_group(
+        self,
+        text_token_id: int,
+        speech_codes: Any | None = None,
+        *,
+        text_tail_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """Build one flattened MiMo decode group.
+
+        The group is represented as ``group_size`` columns of
+        ``[text, rvq0, ..., rvqN]`` and flattened column-major, yielding
+        ``(audio_channels + 1) * group_size`` token ids.
+        """
+
+        if speech_codes is None:
+            codes = self._zero_speech_codes_for_decode_group()
+        else:
+            codes = self._normalize_decode_speech_codes(speech_codes)
+
+        tail_token_id = (
+            int(self.config.empty_token_id)
+            if text_tail_token_id is None
+            else int(text_tail_token_id)
+        )
+        rows = torch.empty(
+            self.audio_channels + 1,
+            self.group_size,
+            dtype=torch.long,
+            device=codes.device,
+        )
+        rows[0].fill_(tail_token_id)
+        rows[0, 0] = int(text_token_id)
+        rows[1:] = codes.transpose(0, 1)
+        return rows.transpose(0, 1).reshape(-1).contiguous()
+
+    def build_empty_decode_token_group(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        do_sample: bool = True,
+        temperature: float = 0.9,
+        top_p: float = 0.95,
+        generator: torch.Generator | None = None,
+        text_tail_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """Build a flattened decode group for a generated ``<|empty|>`` token."""
+
+        speech_codes = self.local_forward(
+            hidden_states,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            generator=generator,
+        )
+        if speech_codes.ndim != 2:
+            raise ValueError(
+                "local_forward for one decode group must return "
+                f"[group_size, audio_channels], got {tuple(speech_codes.shape)}"
+            )
+        return self.build_decode_token_group(
+            int(self.config.empty_token_id),
+            speech_codes,
+            text_tail_token_id=text_tail_token_id,
+        )
+
+    def build_decode_step(
+        self,
+        text_token_id: int,
+        hidden_states: torch.Tensor | None = None,
+        *,
+        do_sample: bool = True,
+        temperature: float = 0.9,
+        top_p: float = 0.95,
+        generator: torch.Generator | None = None,
+        text_tail_token_id: int | None = None,
+    ) -> tuple[torch.Tensor, bool]:
+        """Build one MiMo decode step and report whether it stops generation."""
+
+        text_token_id = int(text_token_id)
+        if text_token_id == int(self.config.empty_token_id):
+            if hidden_states is None:
+                raise ValueError("hidden_states are required for <|empty|> decode")
+            group = self.build_empty_decode_token_group(
+                hidden_states,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                generator=generator,
+                text_tail_token_id=text_tail_token_id,
+            )
+        else:
+            group = self.build_decode_token_group(
+                text_token_id,
+                text_tail_token_id=text_tail_token_id,
+            )
+        return group, text_token_id == int(self.config.stop_token_id)
+
+    def _zero_speech_codes_for_decode_group(self) -> torch.Tensor:
+        return torch.tensor(
+            self.speech_zeroemb_indices,
+            dtype=torch.long,
+        ).unsqueeze(0).expand(self.group_size, -1).contiguous()
+
+    def _normalize_decode_speech_codes(self, speech_codes: Any) -> torch.Tensor:
+        codes = torch.as_tensor(speech_codes, dtype=torch.long)
+        expected = (self.group_size, self.audio_channels)
+        transposed = (self.audio_channels, self.group_size)
+        if tuple(codes.shape) == expected:
+            return codes.contiguous()
+        if tuple(codes.shape) == transposed:
+            return codes.transpose(0, 1).contiguous()
+        raise ValueError(
+            "speech_codes must be [group_size, audio_channels] or "
+            "[audio_channels, group_size], got "
+            f"shape {tuple(codes.shape)}; expected {expected}"
+        )
+
     @staticmethod
     def _sample_logits(
         logits: torch.Tensor,
