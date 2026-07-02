@@ -10,6 +10,7 @@ import torch
 from sglang_omni.models.mimo_asr.audio_tokenizer import (
     MIMO_ASR_SAMPLE_RATE,
     MiMoAudioTokenizerAdapter,
+    _install_flash_attn_varlen_compat,
 )
 
 
@@ -146,3 +147,21 @@ def test_mimo_audio_tokenizer_loads_official_backend(monkeypatch) -> None:
     backend = MiMoAudioTokenizerAdapter("tok", device="cpu")._load_backend()
 
     assert backend.tokenizer.__class__ is _FakeTokenizer
+
+
+def test_mimo_audio_tokenizer_installs_flash_attn_varlen_compat(monkeypatch) -> None:
+    flash_attn = SimpleNamespace()
+    sentinel = object()
+
+    def _fake_import_module(name):
+        if name == "flash_attn":
+            return flash_attn
+        if name == "flash_attn.flash_attn_interface":
+            return SimpleNamespace(flash_attn_varlen_func=sentinel)
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr("importlib.import_module", _fake_import_module)
+
+    _install_flash_attn_varlen_compat()
+
+    assert flash_attn.flash_attn_varlen_func is sentinel

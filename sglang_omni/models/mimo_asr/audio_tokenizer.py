@@ -73,6 +73,7 @@ class MiMoAudioTokenizerAdapter:
             except Exception as exc:  # pragma: no cover - environment dependent
                 last_error = exc
         try:
+            _install_flash_attn_varlen_compat()
             module = importlib.import_module("mimo_audio_tokenizer")
             tokenizer_cls = getattr(module, "MiMoAudioTokenizer")
             self._backend = _OfficialMiMoAudioTokenizerBackend(
@@ -244,6 +245,30 @@ def _as_float_tensor(audio: Any) -> torch.Tensor:
     if isinstance(audio, (list, tuple)):
         return torch.tensor(audio, dtype=torch.float32)
     raise ValueError(f"Unsupported MiMo-ASR audio value: {type(audio).__name__}")
+
+
+def _install_flash_attn_varlen_compat() -> None:
+    """Expose flash_attn_varlen_func where XiaomiMiMo imports it from."""
+
+    import importlib
+
+    try:
+        flash_attn = importlib.import_module("flash_attn")
+    except Exception:
+        return
+    if hasattr(flash_attn, "flash_attn_varlen_func"):
+        return
+    for module_name in (
+        "flash_attn.flash_attn_interface",
+        "flash_attn.flash_attn_interface_v2",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+            func = getattr(module, "flash_attn_varlen_func")
+        except Exception:
+            continue
+        setattr(flash_attn, "flash_attn_varlen_func", func)
+        return
 
 
 __all__ = ["MIMO_ASR_SAMPLE_RATE", "MiMoAudioTokenizerAdapter"]
