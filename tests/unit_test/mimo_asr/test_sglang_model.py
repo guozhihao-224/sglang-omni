@@ -11,6 +11,7 @@ from sglang_omni.models.mimo_asr.model_runner import (
     MiMoASRModelRunner,
     MiMoASROutputProcessor,
     build_mimo_decode_groups,
+    commit_mimo_decode_groups_after_sglang,
     commit_mimo_decode_groups_to_reqs,
 )
 from sglang_omni.models.mimo_asr.sglang_model import (
@@ -821,6 +822,38 @@ def test_mimo_commit_decode_groups_extends_reqs_and_returns_stopped() -> None:
     assert reqs[1].output_ids == [20, 21, 22]
     assert stopped == [reqs[1]]
     assert getattr(reqs[1], "_mimo_asr_stopped") is True
+
+
+def test_mimo_commit_after_sglang_replaces_last_text_token() -> None:
+    reqs = [
+        SimpleNamespace(output_ids=[1, 10], finished_reason=None),
+        SimpleNamespace(output_ids=[2, 20], finished_reason=None),
+    ]
+    batch = SimpleNamespace(reqs=reqs)
+    result = SimpleNamespace(
+        mimo_asr_decode_groups=torch.tensor([[10, 11, 12], [20, 21, 22]]),
+        mimo_asr_stopped=torch.tensor([False, True]),
+    )
+
+    stopped = commit_mimo_decode_groups_after_sglang(batch, result)
+
+    assert reqs[0].output_ids == [1, 10, 11, 12]
+    assert reqs[0].finished_reason is None
+    assert reqs[1].output_ids == [2, 20, 21, 22]
+    assert stopped == [reqs[1]]
+    assert reqs[1].finished_reason is not None
+
+
+def test_mimo_commit_after_sglang_ignores_non_mimo_results() -> None:
+    req = SimpleNamespace(output_ids=[1, 2], finished_reason=None)
+
+    stopped = commit_mimo_decode_groups_after_sglang(
+        SimpleNamespace(reqs=[req]),
+        SimpleNamespace(next_token_ids=torch.tensor([2])),
+    )
+
+    assert stopped == []
+    assert req.output_ids == [1, 2]
 
 
 def test_mimo_commit_decode_groups_validates_shapes() -> None:

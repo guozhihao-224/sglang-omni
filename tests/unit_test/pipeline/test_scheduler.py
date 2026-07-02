@@ -27,6 +27,32 @@ def _init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler._request_build_max_pending_observed = 0
 
 
+def test_omni_scheduler_process_batch_result_runs_post_hook(monkeypatch) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    calls = []
+    batch = object()
+    result = object()
+
+    def _fake_upstream(self, upstream_batch, upstream_result):
+        assert self is scheduler
+        assert upstream_batch is batch
+        assert upstream_result is result
+        calls.append("upstream")
+
+    monkeypatch.setattr(
+        omni_scheduler_module._Upstream,
+        "process_batch_result",
+        _fake_upstream,
+    )
+    scheduler._post_batch_result_hook = lambda hook_batch, hook_result: calls.append(
+        ("hook", hook_batch is batch, hook_result is result)
+    )
+
+    scheduler.process_batch_result(batch, result)
+
+    assert calls == ["upstream", ("hook", True, True)]
+
+
 def test_simple_scheduler_batch_and_error_contracts() -> None:
     """Preserves batched success output and per-request batch failure emission."""
     good = SimpleScheduler(

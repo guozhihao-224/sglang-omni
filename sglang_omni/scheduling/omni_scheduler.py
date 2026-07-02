@@ -111,6 +111,7 @@ class OmniScheduler:
         stream_output_builder: Callable | None = None,
         stream_chunk_handler: Callable | None = None,
         stream_done_handler: Callable | None = None,
+        post_batch_result_hook: Callable | None = None,
         abort_callback: Callable[[str], None] | None = None,
         enable_overlap: bool = False,
         enable_async_decode: bool = False,
@@ -129,6 +130,7 @@ class OmniScheduler:
         self._stream_output_builder = stream_output_builder
         self._stream_chunk_handler = stream_chunk_handler
         self._stream_done_handler = stream_done_handler
+        self._post_batch_result_hook = post_batch_result_hook
         self._abort_callback = abort_callback
         self._request_admission_lock = threading.RLock()
         self.request_build_max_workers = max(1, int(request_build_max_workers))
@@ -816,6 +818,12 @@ class OmniScheduler:
         except Exception as exc:
             self._handle_batch_failure(batch, exc)
             return _FAILED_BATCH_RESULT
+
+    def process_batch_result(self, batch: Any, result: Any) -> None:
+        _Upstream.process_batch_result(self, batch, result)
+        hook = getattr(self, "_post_batch_result_hook", None)
+        if hook is not None:
+            hook(batch, result)
 
     def _run_batch(self, batch, pp_proxy_tensors=None):
         """Run a batch through the model runner.

@@ -12,6 +12,7 @@ from sglang_omni.models.mimo_asr.audio_tokenizer import MiMoAudioTokenizerAdapte
 from sglang_omni.models.mimo_asr.model_runner import (
     MiMoASRModelRunner,
     MiMoASROutputProcessor,
+    commit_mimo_decode_groups_after_sglang,
 )
 from sglang_omni.models.mimo_asr.request_builders import (
     make_mimo_asr_scheduler_adapters,
@@ -118,6 +119,7 @@ def create_sglang_mimo_asr_executor(
         model_runner=MiMoASRModelRunner(model_worker, output_proc),
         request_builder=request_builder,
         result_adapter=result_adapter,
+        post_batch_result_hook=commit_mimo_decode_groups_after_sglang,
         request_build_max_workers=request_build_max_workers,
         request_build_max_pending=request_build_max_pending,
     )

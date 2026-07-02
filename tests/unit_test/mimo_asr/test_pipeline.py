@@ -8,6 +8,9 @@ from types import SimpleNamespace
 import sglang_omni.models.mimo_asr.stages as mimo_asr_stages
 from sglang_omni.models.mimo_asr.config import MiMoASRPipelineConfig
 from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
+from sglang_omni.models.mimo_asr.model_runner import (
+    commit_mimo_decode_groups_after_sglang,
+)
 from sglang_omni.models.mimo_asr.stages import create_sglang_mimo_asr_executor
 from sglang_omni.models.mimo_asr.tool_funcs.audio_lengths import (
     MIMO_ASR_AUDIO_CHANNELS,
@@ -250,6 +253,7 @@ def test_mimo_asr_stage_wires_native_scheduler_components(monkeypatch) -> None:
     }
     assert scheduler.request_builder is request_builder
     assert scheduler.result_adapter is result_adapter
+    assert scheduler.post_batch_result_hook is commit_mimo_decode_groups_after_sglang
     assert scheduler.tp_worker.model_runner.model.return_hidden_states_output is True
     assert scheduler.model_runner.args == (scheduler.tp_worker, "mimo-output-processor")
     assert scheduler.model_runner.kwargs == {}

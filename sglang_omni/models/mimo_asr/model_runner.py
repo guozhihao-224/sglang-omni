@@ -193,6 +193,73 @@ def commit_mimo_decode_groups_to_reqs(
     return stopped_reqs
 
 
+def commit_mimo_decode_groups_after_sglang(
+    batch: Any,
+    result: Any,
+) -> list[Any]:
+    """Replace SGLang's just-appended text ids with MiMo flat groups.
+
+    Upstream SGLang appends one sampled text token per request in
+    ``process_batch_result``. MiMo needs final request outputs to contain the
+    full flattened group whose first element is that text token. This hook runs
+    after upstream processing and replaces the trailing text token with the
+    full group while leaving scheduler/KV advancement untouched.
+    """
+
+    groups = getattr(result, "mimo_asr_decode_groups", None)
+    if groups is None:
+        return []
+    reqs = list(getattr(batch, "reqs", []) or [])
+    if groups.ndim != 2:
+        raise ValueError(
+            "mimo_asr_decode_groups must be [batch, group_len], got "
+            f"{tuple(groups.shape)}"
+        )
+    if int(groups.shape[0]) != len(reqs):
+        raise ValueError(
+            "mimo_asr_decode_groups batch size must match reqs "
+            f"({groups.shape[0]} != {len(reqs)})"
+        )
+
+    stopped = getattr(result, "mimo_asr_stopped", None)
+    stopped_values = (
+        _stopped_to_list(stopped) if stopped is not None else [False] * len(reqs)
+    )
+    if len(stopped_values) != len(reqs):
+        raise ValueError(
+            "mimo_asr_stopped length must match reqs "
+            f"({len(stopped_values)} != {len(reqs)})"
+        )
+
+    stopped_reqs: list[Any] = []
+    group_rows = groups.detach().cpu().tolist()
+    for req, group, is_stopped in zip(reqs, group_rows, stopped_values, strict=True):
+        flat_group = [int(token_id) for token_id in group]
+        output_ids = getattr(req, "output_ids", None)
+        if output_ids is None:
+            req.output_ids = flat_group
+        elif output_ids and int(output_ids[-1]) == flat_group[0]:
+            output_ids[-1:] = flat_group
+        else:
+            output_ids.extend(flat_group)
+
+        if is_stopped:
+            _mark_mimo_req_finished(req, flat_group[0])
+            stopped_reqs.append(req)
+    return stopped_reqs
+
+
+def _mark_mimo_req_finished(req: Any, matched_token_id: int) -> None:
+    if getattr(req, "finished_reason", None) is not None:
+        return
+    try:
+        from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
+    except ImportError:  # pragma: no cover - defensive for non-SGLang envs
+        setattr(req, "_mimo_asr_stopped", True)
+        return
+    req.finished_reason = FINISH_MATCHED_TOKEN(int(matched_token_id))
+
+
 def build_mimo_decode_groups(
     model: Any,
     text_token_ids: torch.Tensor,
@@ -274,6 +341,7 @@ def _stopped_to_list(stopped: torch.Tensor | list[bool] | tuple[bool, ...]) -> l
 
 __all__ = [
     "commit_mimo_decode_groups_to_reqs",
+    "commit_mimo_decode_groups_after_sglang",
     "MiMoASRModelRunner",
     "MiMoASROutputProcessor",
     "build_mimo_decode_groups",
