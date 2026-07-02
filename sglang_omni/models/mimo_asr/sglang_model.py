@@ -488,10 +488,16 @@ class MiMoV2ASRForCausalLM(nn.Module):
             top_p=top_p,
             generator=generator,
         )
-        if speech_codes.ndim != 2:
+        expected = (self.group_size, self.audio_channels)
+        transposed = (self.audio_channels, self.group_size)
+        if speech_codes.ndim != 2 or tuple(speech_codes.shape) not in {
+            expected,
+            transposed,
+        }:
             raise ValueError(
                 "local_forward for one decode group must return "
-                f"[group_size, audio_channels], got {tuple(speech_codes.shape)}"
+                "[group_size, audio_channels] or [audio_channels, group_size], "
+                f"got {tuple(speech_codes.shape)}"
             )
         return self.build_decode_token_group(
             int(self.config.empty_token_id),

@@ -513,12 +513,20 @@ def test_mimo_model_build_decode_token_group_with_speech_codes() -> None:
 
 
 def test_mimo_model_build_decode_token_group_accepts_channel_first_codes() -> None:
-    model = MiMoV2ASRForCausalLM(_tiny_config(empty_token_id=99))
-    speech_codes = torch.tensor([[10, 11], [20, 21]])
+    model = MiMoV2ASRForCausalLM(
+        _tiny_config(
+            audio_channels=3,
+            empty_token_id=99,
+            speech_vocab_size="5-6-7",
+            speech_zeroemb_idx="4-5-6",
+            delay_pattern="0-1-2",
+        )
+    )
+    speech_codes = torch.tensor([[10, 11], [20, 21], [30, 31]])
 
     group = model.build_decode_token_group(7, speech_codes)
 
-    assert torch.equal(group, torch.tensor([7, 10, 20, 99, 11, 21]))
+    assert torch.equal(group, torch.tensor([7, 10, 20, 30, 99, 11, 21, 31]))
 
 
 def test_mimo_model_build_decode_token_group_fills_zeroemb_without_speech() -> None:
