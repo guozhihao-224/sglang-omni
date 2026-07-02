@@ -316,6 +316,52 @@ class MiMoV2ASRForCausalLM(nn.Module):
 
         return padded_ids
 
+    def merge_audio_embeds_into_token_embeds(
+        self,
+        token_embeds: torch.Tensor,
+        items: list[Any],
+    ) -> torch.Tensor:
+        """Scatter encoded audio embeddings into token embeddings.
+
+        This is the prefill merge primitive used before calling the text
+        backbone with ``inputs_embeds``.  It expects item offsets to be inclusive
+        and already aligned with hidden groups.
+        """
+
+        if token_embeds.ndim != 2:
+            raise ValueError(
+                "token_embeds must be [seq_len, hidden_size], got "
+                f"shape {tuple(token_embeds.shape)}"
+            )
+        merged = token_embeds.clone()
+        for item in items:
+            offsets = list(getattr(item, "offsets", None) or [])
+            if not offsets:
+                raise ValueError("MiMo-ASR audio item must have offsets before scatter")
+            positions = self._positions_from_offsets(offsets)
+            audio_hidden = self.encode_audio_codes_to_hidden(self._audio_codes_from_item(item)).to(
+                device=merged.device,
+                dtype=merged.dtype,
+            )
+            if len(positions) != int(audio_hidden.shape[0]):
+                raise ValueError(
+                    "MiMo-ASR scatter positions must match audio hidden groups "
+                    f"({len(positions)} != {audio_hidden.shape[0]})"
+                )
+            if int(audio_hidden.shape[1]) != int(merged.shape[1]):
+                raise ValueError(
+                    "MiMo-ASR audio hidden size must match token embedding size "
+                    f"({audio_hidden.shape[1]} != {merged.shape[1]})"
+                )
+            for row_idx, position in enumerate(positions):
+                if position < 0 or position >= int(merged.shape[0]):
+                    raise ValueError(
+                        f"MiMo-ASR scatter position {position} is outside "
+                        f"sequence length {merged.shape[0]}"
+                    )
+                merged[position] = audio_hidden[row_idx]
+        return merged
+
     @staticmethod
     def _ensure_item_pad_value(item: Any) -> None:
         if getattr(item, "pad_value", None) is not None:

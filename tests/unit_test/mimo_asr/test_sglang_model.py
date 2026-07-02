@@ -393,3 +393,88 @@ def test_mimo_model_pad_input_ids_rejects_missing_placeholders() -> None:
         assert "not contain enough" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("missing placeholders should fail")
+
+
+def test_mimo_model_merge_audio_embeds_into_token_embeds_single_item() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+    with torch.no_grad():
+        for embedding in model.speech_embeddings:
+            embedding.weight.fill_(1.0)
+        model.speech_group_downcast.weight.fill_(1.0)
+        model.speech_group_downcast.bias.zero_()
+    token_embeds = torch.tensor([[0.0], [1.0], [2.0]])
+    item = _FakeMMItem(
+        torch.tensor([[0, 0], [1, 1]]),
+        pad_value=-1,
+        offsets=[(1, 1)],
+    )
+
+    merged = model.merge_audio_embeds_into_token_embeds(token_embeds, [item])
+
+    assert torch.equal(merged, torch.tensor([[0.0], [12.0], [2.0]]))
+    assert torch.equal(token_embeds, torch.tensor([[0.0], [1.0], [2.0]]))
+
+
+def test_mimo_model_merge_audio_embeds_into_token_embeds_multiple_items() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+    with torch.no_grad():
+        for embedding in model.speech_embeddings:
+            embedding.weight.fill_(1.0)
+        model.speech_group_downcast.weight.fill_(1.0)
+        model.speech_group_downcast.bias.zero_()
+    token_embeds = torch.zeros(5, 1)
+    items = [
+        _FakeMMItem(torch.tensor([[0, 0], [1, 1]]), offsets=[(1, 1)]),
+        _FakeMMItem(torch.tensor([[2, 2], [3, 3], [4, 4]]), offsets=[(3, 4)]),
+    ]
+
+    merged = model.merge_audio_embeds_into_token_embeds(token_embeds, items)
+
+    assert torch.equal(merged, torch.tensor([[0.0], [12.0], [0.0], [12.0], [12.0]]))
+
+
+def test_mimo_model_merge_audio_embeds_requires_offsets() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+    item = _FakeMMItem(torch.tensor([[0, 0], [1, 1]]))
+
+    try:
+        model.merge_audio_embeds_into_token_embeds(torch.zeros(3, 1), [item])
+    except ValueError as exc:
+        assert "must have offsets" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("missing offsets should fail")
+
+
+def test_mimo_model_merge_audio_embeds_rejects_length_mismatch() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+    item = _FakeMMItem(torch.tensor([[0, 0], [1, 1], [2, 2]]), offsets=[(1, 1)])
+
+    try:
+        model.merge_audio_embeds_into_token_embeds(torch.zeros(3, 1), [item])
+    except ValueError as exc:
+        assert "positions must match" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("length mismatch should fail")
+
+
+def test_mimo_model_merge_audio_embeds_rejects_hidden_size_mismatch() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=2))
+    item = _FakeMMItem(torch.tensor([[0, 0], [1, 1]]), offsets=[(1, 1)])
+
+    try:
+        model.merge_audio_embeds_into_token_embeds(torch.zeros(3, 1), [item])
+    except ValueError as exc:
+        assert "hidden size" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("hidden size mismatch should fail")
+
+
+def test_mimo_model_merge_audio_embeds_rejects_bad_token_embed_shape() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+
+    try:
+        model.merge_audio_embeds_into_token_embeds(torch.zeros(1, 2, 1), [])
+    except ValueError as exc:
+        assert "token_embeds" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad token embed shape should fail")
