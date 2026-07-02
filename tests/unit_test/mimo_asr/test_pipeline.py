@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
+import sglang_omni.models.mimo_asr.stages as mimo_asr_stages
 from sglang_omni.models.mimo_asr.config import MiMoASRPipelineConfig
 from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
 from sglang_omni.models.mimo_asr.stages import create_sglang_mimo_asr_executor
@@ -131,3 +133,121 @@ def test_mimo_asr_config_extends_flat_qwen2_shape_with_audio_fields() -> None:
     assert config.delay_pattern_values == [0, 1, 2, 3, 4, 5, 6, 7]
     assert config.empty_token_id == 151667
     assert config.stop_token_id == 151645
+
+
+def test_mimo_asr_stage_wires_native_scheduler_components(monkeypatch) -> None:
+    build_kwargs: dict[str, object] = {}
+    infrastructure_kwargs: dict[str, object] = {}
+    adapter_kwargs: dict[str, object] = {}
+    cache_sizes: list[int] = []
+
+    tokenizer = object()
+    audio_tokenizer = object()
+    request_builder = object()
+    result_adapter = object()
+
+    monkeypatch.setattr(
+        mimo_asr_stages.AutoTokenizer,
+        "from_pretrained",
+        lambda *args, **kwargs: tokenizer,
+    )
+    monkeypatch.setattr(
+        mimo_asr_stages,
+        "MiMoAudioTokenizerAdapter",
+        lambda path, *, device: audio_tokenizer,
+    )
+    monkeypatch.setattr(
+        mimo_asr_stages,
+        "init_mm_embedding_cache",
+        lambda size: cache_sizes.append(size),
+    )
+    monkeypatch.setattr(
+        mimo_asr_stages,
+        "make_mimo_asr_scheduler_adapters",
+        lambda **kwargs: (adapter_kwargs.update(kwargs) or (request_builder, result_adapter)),
+    )
+    monkeypatch.setattr(
+        mimo_asr_stages,
+        "ModelRunner",
+        lambda *args, **kwargs: SimpleNamespace(args=args, kwargs=kwargs),
+    )
+    monkeypatch.setattr(
+        mimo_asr_stages,
+        "SGLangOutputProcessor",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(
+        mimo_asr_stages,
+        "OmniScheduler",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+    def _fake_server_args_builder(model_path, context_length, **overrides):
+        build_kwargs.update(overrides)
+        build_kwargs["context_length"] = context_length
+        return SimpleNamespace(**overrides)
+
+    def _fake_create_infrastructure(server_args, gpu_id, **kwargs):
+        infrastructure_kwargs.update(kwargs)
+        infrastructure_kwargs["gpu_id"] = gpu_id
+        model_worker = SimpleNamespace(
+            gpu_id=gpu_id,
+            model_runner=SimpleNamespace(model=object()),
+        )
+        return False, (
+            model_worker,
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+        )
+
+    monkeypatch.setattr(
+        mimo_asr_stages,
+        "build_sglang_server_args",
+        _fake_server_args_builder,
+    )
+    monkeypatch.setattr(
+        mimo_asr_stages,
+        "validate_generation_batch_policy",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        mimo_asr_stages,
+        "create_sglang_infrastructure_defer_cuda_graph",
+        _fake_create_infrastructure,
+    )
+
+    scheduler = mimo_asr_stages.create_sglang_mimo_asr_executor(
+        "XiaomiMiMo/MiMo-V2.5-ASR",
+        audio_tokenizer_path="/models/mimo-audio-tokenizer",
+        device="cuda:3",
+        max_running_requests=4,
+        max_new_tokens=256,
+        mm_embedding_cache_size_bytes=123,
+    )
+
+    assert build_kwargs["disable_cuda_graph"] is True
+    assert build_kwargs["disable_overlap_schedule"] is True
+    assert build_kwargs["max_running_requests"] == 4
+    assert build_kwargs["max_prefill_tokens"] == 8192
+    assert build_kwargs["chunked_prefill_size"] == 8192
+    assert build_kwargs["sampling_backend"] == "pytorch"
+    assert build_kwargs["dtype"] == "bfloat16"
+    assert build_kwargs["context_length"] == 8448
+    assert infrastructure_kwargs == {
+        "gpu_id": 3,
+        "model_arch_override": "MiMoV2ASRForCausalLM",
+    }
+    assert cache_sizes == [123]
+    assert adapter_kwargs == {
+        "tokenizer": tokenizer,
+        "audio_tokenizer": audio_tokenizer,
+        "max_new_tokens": 256,
+    }
+    assert scheduler.request_builder is request_builder
+    assert scheduler.result_adapter is result_adapter
+    assert scheduler.request_build_max_workers == 1
+    assert scheduler.request_build_max_pending == 8
