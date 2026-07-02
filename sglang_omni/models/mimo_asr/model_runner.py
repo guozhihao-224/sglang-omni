@@ -21,10 +21,10 @@ from sglang_omni.scheduling.types import RequestOutput, SchedulerOutput
 class MiMoASRModelRunner(ModelRunner):
     """ASR runner scaffold for MiMo's grouped decode semantics.
 
-    The full scheduler integration still needs to teach SGLang how to advance a
-    request by a flattened MiMo group.  The helper below is intentionally pure:
-    it consumes sampled text ids plus hidden states and returns per-row flat
-    groups using methods implemented on ``MiMoV2ASRForCausalLM``.
+    SGLang's scheduler still advances KV/cache state with one text token per
+    request.  MiMo's full flattened decode group is therefore carried on a
+    MiMo-specific result attribute for streaming/result adaptation instead of
+    replacing ``next_token_ids`` or ``schedule_batch.output_ids``.
     """
 
     def build_decode_groups(
@@ -49,6 +49,70 @@ class MiMoASRModelRunner(ModelRunner):
             text_tail_token_id=text_tail_token_id,
         )
 
+    def post_prefill(
+        self,
+        result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> None:
+        self._expand_sampled_text_ids(result, forward_batch, schedule_batch, requests)
+
+    def post_decode(
+        self,
+        result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> None:
+        self._expand_sampled_text_ids(result, forward_batch, schedule_batch, requests)
+
+    def _expand_sampled_text_ids(
+        self,
+        result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> None:
+        if result.next_token_ids is None:
+            result.next_token_ids = self._sample_next_token_ids(
+                result.logits_output,
+                forward_batch,
+                schedule_batch,
+                requests,
+            )
+        hidden_states = getattr(result.logits_output, "hidden_states", None)
+        text_token_ids = result.next_token_ids
+        groups, stopped = self.build_decode_groups(
+            text_token_ids,
+            hidden_states,
+            do_sample=True,
+            temperature=0.9,
+            top_p=0.95,
+        )
+        result.mimo_asr_decode_groups = groups.to(device=text_token_ids.device)
+        result.mimo_asr_stopped = stopped.to(device=text_token_ids.device)
+
+    def post_process_outputs(
+        self,
+        result: Any,
+        scheduler_output: Any,
+        outputs: dict[str, RequestOutput],
+    ) -> None:
+        groups = getattr(result, "mimo_asr_decode_groups", None)
+        if groups is None:
+            return
+        stopped = getattr(result, "mimo_asr_stopped", None)
+        stopped_values = _stopped_to_list(stopped) if stopped is not None else []
+        group_rows = groups.detach().cpu().tolist()
+        for row_idx, sched_req in enumerate(scheduler_output.requests):
+            if row_idx >= len(group_rows):
+                continue
+            req_output = outputs[sched_req.request_id]
+            req_output.data = group_rows[row_idx]
+            if row_idx < len(stopped_values):
+                req_output.finished = bool(stopped_values[row_idx])
+
 
 class MiMoASROutputProcessor:
     """Output processor for grouped MiMo decode ids.
@@ -65,7 +129,11 @@ class MiMoASROutputProcessor:
         model_output: Any,
         scheduler_output: SchedulerOutput,
     ) -> dict[str, RequestOutput]:
-        groups = model_output.next_token_ids
+        groups = getattr(model_output, "mimo_asr_decode_groups", None)
+        if groups is None:
+            groups = model_output.next_token_ids
+        stopped = getattr(model_output, "mimo_asr_stopped", None)
+        stopped_values = _stopped_to_list(stopped) if stopped is not None else []
         if groups is None:
             group_list: list[Any] = []
         elif isinstance(groups, torch.Tensor):
@@ -79,7 +147,9 @@ class MiMoASROutputProcessor:
             outputs[sched_req.request_id] = RequestOutput(
                 request_id=sched_req.request_id,
                 data=data,
-                finished=False,
+                finished=bool(stopped_values[row_idx])
+                if row_idx < len(stopped_values)
+                else False,
             )
         return outputs
 

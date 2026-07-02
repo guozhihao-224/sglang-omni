@@ -8,8 +8,11 @@ from typing import Any
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from transformers import AutoTokenizer
 
-from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.mimo_asr.audio_tokenizer import MiMoAudioTokenizerAdapter
+from sglang_omni.models.mimo_asr.model_runner import (
+    MiMoASRModelRunner,
+    MiMoASROutputProcessor,
+)
 from sglang_omni.models.mimo_asr.request_builders import (
     make_mimo_asr_scheduler_adapters,
 )
@@ -21,10 +24,7 @@ from sglang_omni.scheduling.generation_batch_policy import (
     validate_generation_batch_policy,
 )
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
-from sglang_omni.scheduling.sglang_backend import (
-    SGLangOutputProcessor,
-    build_sglang_server_args,
-)
+from sglang_omni.scheduling.sglang_backend import build_sglang_server_args
 
 
 def create_sglang_mimo_asr_executor(
@@ -33,7 +33,7 @@ def create_sglang_mimo_asr_executor(
     audio_tokenizer_path: str = "XiaomiMiMo/MiMo-Audio-Tokenizer",
     device: str = "cuda:0",
     dtype: str = "bfloat16",
-    max_running_requests: int = 8,
+    max_running_requests: int = 1,
     max_new_tokens: int = 8192,
     mem_fraction_static: float | None = None,
     mm_embedding_cache_size_bytes: int = 0,
@@ -55,6 +55,7 @@ def create_sglang_mimo_asr_executor(
     defaults: dict[str, Any] = {
         "disable_cuda_graph": True,
         "disable_overlap_schedule": True,
+        "enable_async_decode": False,
         "enable_torch_compile": enable_torch_compile,
         "mem_fraction_static": mem_fraction_static,
         "max_prefill_tokens": 8192,
@@ -97,11 +98,8 @@ def create_sglang_mimo_asr_executor(
 
     init_mm_embedding_cache(mm_embedding_cache_size_bytes)
 
-    output_proc = SGLangOutputProcessor(
-        capture_hidden=False,
-        capture_hidden_layers=None,
-        model=model_worker.model_runner.model,
-    )
+    model_worker.model_runner.model.return_hidden_states_output = True
+    output_proc = MiMoASROutputProcessor()
     request_builder, result_adapter = make_mimo_asr_scheduler_adapters(
         tokenizer=tokenizer,
         audio_tokenizer=audio_tokenizer,
@@ -117,7 +115,7 @@ def create_sglang_mimo_asr_executor(
         model_config=model_config,
         prefill_manager=prefill_mgr,
         decode_manager=decode_mgr,
-        model_runner=ModelRunner(model_worker, output_proc),
+        model_runner=MiMoASRModelRunner(model_worker, output_proc),
         request_builder=request_builder,
         result_adapter=result_adapter,
         request_build_max_workers=request_build_max_workers,

@@ -8,6 +8,7 @@ import torch
 
 from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
 from sglang_omni.models.mimo_asr.model_runner import (
+    MiMoASRModelRunner,
     MiMoASROutputProcessor,
     build_mimo_decode_groups,
     commit_mimo_decode_groups_to_reqs,
@@ -711,7 +712,9 @@ def test_mimo_decode_groups_helper_validates_shapes() -> None:
 def test_mimo_asr_output_processor_preserves_grouped_ids() -> None:
     processor = MiMoASROutputProcessor()
     model_output = SimpleNamespace(
-        next_token_ids=torch.tensor([[1, 2, 3], [4, 5, 6]])
+        next_token_ids=torch.tensor([1, 4]),
+        mimo_asr_decode_groups=torch.tensor([[1, 2, 3], [4, 5, 6]]),
+        mimo_asr_stopped=torch.tensor([False, True]),
     )
     scheduler_output = SimpleNamespace(
         requests=[
@@ -725,6 +728,83 @@ def test_mimo_asr_output_processor_preserves_grouped_ids() -> None:
     assert outputs["r0"].data == [1, 2, 3]
     assert outputs["r1"].data == [4, 5, 6]
     assert outputs["r0"].finished is False
+    assert outputs["r1"].finished is True
+
+
+def test_mimo_runner_post_decode_preserves_scheduler_text_ids() -> None:
+    model = MiMoV2ASRForCausalLM(
+        _tiny_config(empty_token_id=99, stop_token_id=42, speech_zeroemb_idx="4-5")
+    )
+    model.local_forward = lambda hidden_states, **kwargs: torch.tensor(
+        [[10, 20], [11, 21]]
+    )
+    runner = object.__new__(MiMoASRModelRunner)
+    runner.model = model
+    result = SimpleNamespace(
+        next_token_ids=torch.tensor([8, 99, 42]),
+        logits_output=SimpleNamespace(hidden_states=torch.ones(3, 7)),
+    )
+    schedule_batch = SimpleNamespace(output_ids=torch.tensor([8, 99, 42]))
+
+    runner.post_decode(result, None, schedule_batch, [])
+
+    assert torch.equal(result.next_token_ids, torch.tensor([8, 99, 42]))
+    assert torch.equal(schedule_batch.output_ids, torch.tensor([8, 99, 42]))
+    assert torch.equal(
+        result.mimo_asr_decode_groups,
+        torch.tensor(
+            [
+                [8, 4, 5, 0, 4, 5],
+                [99, 10, 20, 0, 11, 21],
+                [42, 4, 5, 0, 4, 5],
+            ]
+        ),
+    )
+    assert torch.equal(result.mimo_asr_stopped, torch.tensor([False, False, True]))
+
+
+def test_mimo_runner_post_prefill_samples_missing_text_ids() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+    runner = object.__new__(MiMoASRModelRunner)
+    runner.model = model
+    runner._sample_next_token_ids = lambda *args: torch.tensor([7])
+    result = SimpleNamespace(
+        next_token_ids=None,
+        logits_output=SimpleNamespace(hidden_states=torch.ones(1, 7)),
+    )
+
+    runner.post_prefill(result, "forward", "schedule", ["request"])
+
+    assert torch.equal(result.next_token_ids, torch.tensor([7]))
+    assert torch.equal(
+        result.mimo_asr_decode_groups,
+        torch.tensor([[7, 4, 5, 0, 4, 5]]),
+    )
+
+
+def test_mimo_runner_post_process_outputs_replaces_text_with_group() -> None:
+    runner = object.__new__(MiMoASRModelRunner)
+    result = SimpleNamespace(
+        mimo_asr_decode_groups=torch.tensor([[1, 2, 3], [4, 5, 6]]),
+        mimo_asr_stopped=torch.tensor([False, True]),
+    )
+    scheduler_output = SimpleNamespace(
+        requests=[
+            SimpleNamespace(request_id="r0"),
+            SimpleNamespace(request_id="r1"),
+        ]
+    )
+    outputs = {
+        "r0": SimpleNamespace(data=1, finished=False),
+        "r1": SimpleNamespace(data=4, finished=False),
+    }
+
+    runner.post_process_outputs(result, scheduler_output, outputs)
+
+    assert outputs["r0"].data == [1, 2, 3]
+    assert outputs["r0"].finished is False
+    assert outputs["r1"].data == [4, 5, 6]
+    assert outputs["r1"].finished is True
 
 
 def test_mimo_commit_decode_groups_extends_reqs_and_returns_stopped() -> None:

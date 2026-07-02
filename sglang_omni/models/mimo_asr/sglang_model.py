@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 import torch
 import torch.nn as nn
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
@@ -225,6 +226,7 @@ class MiMoV2ASRForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.prefix = prefix
         self.language_model = None
+        self.return_hidden_states_output = False
         self.audio_channels = int(config.audio_channels)
         self.group_size = int(config.group_size)
         self.speech_vocab_sizes = list(config.speech_vocab_sizes)
@@ -886,18 +888,25 @@ class MiMoV2ASRForCausalLM(nn.Module):
                 input_embeds = self.prepare_prefill_inputs_embeds(input_ids, mm_items)
 
         if input_embeds is None:
-            return language_model(
+            hidden_states = language_model(
                 input_ids=input_ids,
                 positions=positions,
                 forward_batch=forward_batch,
                 **kwargs,
             )
-        return language_model(
-            input_ids=input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds,
-            **kwargs,
+        else:
+            hidden_states = language_model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                **kwargs,
+            )
+        if not self.return_hidden_states_output:
+            return hidden_states
+        return LogitsProcessorOutput(
+            next_token_logits=hidden_states.new_empty((hidden_states.shape[0], 1)),
+            hidden_states=hidden_states,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
