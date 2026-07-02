@@ -239,15 +239,114 @@ class MiMoV2ASRForCausalLM(nn.Module):
             raise ValueError("MiMo-ASR get_audio_feature requires at least one item")
         encoded_items: list[torch.Tensor] = []
         for item in items:
-            model_specific_data = getattr(item, "model_specific_data", None) or {}
-            codes = model_specific_data.get("audio_codes", getattr(item, "feature", None))
-            if codes is None:
-                raise ValueError("MiMo-ASR audio item is missing audio_codes/feature")
+            codes = self._audio_codes_from_item(item)
             encoded_items.append(self.encode_audio_codes_to_hidden(codes))
         return torch.cat(encoded_items, dim=0)
 
+    @staticmethod
+    def _audio_codes_from_item(item: Any) -> Any:
+        model_specific_data = getattr(item, "model_specific_data", None) or {}
+        codes = model_specific_data.get("audio_codes", getattr(item, "feature", None))
+        if codes is None:
+            raise ValueError("MiMo-ASR audio item is missing audio_codes/feature")
+        return codes
+
     def pad_input_ids(self, input_ids: list[int], mm_inputs: Any):
-        raise NotImplementedError("MiMo-ASR pad_input_ids is not implemented yet")
+        """Replace MiMo ``<|empty|>`` placeholders with item pad values.
+
+        SGLang's multimodal embedding scatter uses each item's ``pad_value`` and
+        inclusive ``offsets`` to locate positions.  Request builders normally
+        precompute those fields, but this hook keeps the model robust when it is
+        invoked through SGLang's native multimodal padding path.
+        """
+
+        mm_items = list(getattr(mm_inputs, "mm_items", None) or [])
+        if not mm_items:
+            return input_ids
+
+        padded_ids = list(input_ids)
+        empty_positions = [
+            idx
+            for idx, token_id in enumerate(padded_ids)
+            if token_id == self.config.empty_token_id
+        ]
+        consumed_empty_positions = 0
+
+        for item in mm_items:
+            expected_tokens = int(
+                self.encode_audio_codes_to_hidden(
+                    self._audio_codes_from_item(item)
+                ).shape[0]
+            )
+            self._ensure_item_pad_value(item)
+            pad_value = item.pad_value
+            offsets = list(getattr(item, "offsets", None) or [])
+            if offsets:
+                positions = self._positions_from_offsets(offsets)
+                if len(positions) != expected_tokens:
+                    raise ValueError(
+                        "MiMo-ASR offset span length must match audio hidden groups "
+                        f"({len(positions)} != {expected_tokens})"
+                    )
+            else:
+                positions = empty_positions[
+                    consumed_empty_positions : consumed_empty_positions + expected_tokens
+                ]
+                if len(positions) != expected_tokens:
+                    raise ValueError(
+                        "MiMo-ASR input_ids do not contain enough <|empty|> placeholders "
+                        f"({len(positions)} != {expected_tokens})"
+                    )
+                self._set_item_offsets(item, positions)
+                consumed_empty_positions += expected_tokens
+
+            for position in positions:
+                if position < 0 or position >= len(padded_ids):
+                    raise ValueError(
+                        f"MiMo-ASR offset position {position} is outside "
+                        f"input length {len(padded_ids)}"
+                    )
+                token_id = padded_ids[position]
+                if token_id not in {self.config.empty_token_id, pad_value}:
+                    raise ValueError(
+                        "MiMo-ASR offset points to non-placeholder token "
+                        f"at position {position}: {token_id}"
+                    )
+                padded_ids[position] = pad_value
+
+        return padded_ids
+
+    @staticmethod
+    def _ensure_item_pad_value(item: Any) -> None:
+        if getattr(item, "pad_value", None) is not None:
+            return
+        set_pad_value = getattr(item, "set_pad_value", None)
+        if callable(set_pad_value):
+            set_pad_value()
+        if getattr(item, "pad_value", None) is None:
+            raise ValueError("MiMo-ASR multimodal item is missing pad_value")
+
+    @staticmethod
+    def _positions_from_offsets(offsets: list[tuple[int, int]]) -> list[int]:
+        positions: list[int] = []
+        for start, end in offsets:
+            if end < start:
+                raise ValueError(f"MiMo-ASR invalid offset span ({start}, {end})")
+            positions.extend(range(int(start), int(end) + 1))
+        return positions
+
+    @staticmethod
+    def _set_item_offsets(item: Any, positions: list[int]) -> None:
+        if not positions:
+            item.offsets = []
+            return
+        expected = list(range(positions[0], positions[0] + len(positions)))
+        if positions != expected:
+            raise ValueError(
+                "MiMo-ASR inferred placeholder positions must be contiguous"
+            )
+        item.offsets = [(positions[0], positions[-1])]
+
 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         raise NotImplementedError("MiMo-ASR forward/decode is not implemented yet")

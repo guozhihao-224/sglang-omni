@@ -35,6 +35,17 @@ def _tiny_config(**overrides) -> MiMoV2ASRConfig:
     return MiMoV2ASRConfig(**defaults)
 
 
+class _FakeMMItem:
+    def __init__(self, codes, *, pad_value: int | None = None, offsets=None) -> None:
+        self.feature = codes
+        self.model_specific_data = {}
+        self.pad_value = pad_value
+        self.offsets = offsets
+
+    def set_pad_value(self) -> None:
+        self.pad_value = -1000 - int(torch.as_tensor(self.feature).numel())
+
+
 def test_normalize_mimo_audio_codes_accepts_t_by_c_and_c_by_t() -> None:
     t_by_c = torch.arange(6).reshape(3, 2)
     c_by_t = t_by_c.transpose(0, 1)
@@ -282,3 +293,103 @@ def test_mimo_model_get_audio_feature_validates_items() -> None:
         assert "missing audio_codes" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("missing audio codes should fail")
+
+
+def test_mimo_model_pad_input_ids_uses_existing_offsets() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+    item = _FakeMMItem(
+        torch.tensor([[0, 0], [1, 1]]),
+        pad_value=-7,
+        offsets=[(1, 1)],
+    )
+    mm_inputs = SimpleNamespace(mm_items=[item])
+
+    padded = model.pad_input_ids([11, model.config.empty_token_id, 12], mm_inputs)
+
+    assert padded == [11, -7, 12]
+    assert item.offsets == [(1, 1)]
+
+
+def test_mimo_model_pad_input_ids_infers_offsets_from_empty_tokens() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+    item = _FakeMMItem(torch.tensor([[0, 0], [1, 1], [2, 2]]))
+    mm_inputs = SimpleNamespace(mm_items=[item])
+
+    padded = model.pad_input_ids(
+        [11, model.config.empty_token_id, model.config.empty_token_id, 12],
+        mm_inputs,
+    )
+
+    assert padded == [11, item.pad_value, item.pad_value, 12]
+    assert item.offsets == [(1, 2)]
+
+
+def test_mimo_model_pad_input_ids_handles_multiple_items() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+    first = _FakeMMItem(torch.tensor([[0, 0], [1, 1]]), pad_value=-1)
+    second = _FakeMMItem(torch.tensor([[2, 2], [3, 3], [4, 4]]), pad_value=-2)
+    mm_inputs = SimpleNamespace(mm_items=[first, second])
+
+    padded = model.pad_input_ids(
+        [
+            11,
+            model.config.empty_token_id,
+            12,
+            model.config.empty_token_id,
+            model.config.empty_token_id,
+        ],
+        mm_inputs,
+    )
+
+    assert padded == [11, -1, 12, -2, -2]
+    assert first.offsets == [(1, 1)]
+    assert second.offsets == [(3, 4)]
+
+
+def test_mimo_model_pad_input_ids_rejects_offset_length_mismatch() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+    item = _FakeMMItem(
+        torch.tensor([[0, 0], [1, 1], [2, 2]]),
+        pad_value=-1,
+        offsets=[(1, 1)],
+    )
+
+    try:
+        model.pad_input_ids(
+            [11, model.config.empty_token_id, 12],
+            SimpleNamespace(mm_items=[item]),
+        )
+    except ValueError as exc:
+        assert "offset span length" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("offset mismatch should fail")
+
+
+def test_mimo_model_pad_input_ids_rejects_non_placeholder_offset() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+    item = _FakeMMItem(torch.tensor([[0, 0], [1, 1]]), pad_value=-1, offsets=[(1, 1)])
+
+    try:
+        model.pad_input_ids(
+            [11, 999, 12],
+            SimpleNamespace(mm_items=[item]),
+        )
+    except ValueError as exc:
+        assert "non-placeholder" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("non-placeholder offset should fail")
+
+
+def test_mimo_model_pad_input_ids_rejects_missing_placeholders() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config())
+    item = _FakeMMItem(torch.tensor([[0, 0], [1, 1], [2, 2]]), pad_value=-1)
+
+    try:
+        model.pad_input_ids(
+            [11, model.config.empty_token_id, 12],
+            SimpleNamespace(mm_items=[item]),
+        )
+    except ValueError as exc:
+        assert "not contain enough" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("missing placeholders should fail")
