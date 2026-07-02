@@ -190,9 +190,10 @@ def test_mimo_asr_stage_wires_native_scheduler_components(monkeypatch) -> None:
     def _fake_create_infrastructure(server_args, gpu_id, **kwargs):
         infrastructure_kwargs.update(kwargs)
         infrastructure_kwargs["gpu_id"] = gpu_id
+        model = SimpleNamespace(return_hidden_states_output=False)
         model_worker = SimpleNamespace(
             gpu_id=gpu_id,
-            model_runner=SimpleNamespace(model=object()),
+            model_runner=SimpleNamespace(model=model),
         )
         return False, (
             model_worker,
@@ -249,6 +250,7 @@ def test_mimo_asr_stage_wires_native_scheduler_components(monkeypatch) -> None:
     }
     assert scheduler.request_builder is request_builder
     assert scheduler.result_adapter is result_adapter
+    assert scheduler.tp_worker.model_runner.model.return_hidden_states_output is True
     assert scheduler.model_runner.args == (scheduler.tp_worker, "mimo-output-processor")
     assert scheduler.model_runner.kwargs == {}
     assert scheduler.request_build_max_workers == 1
