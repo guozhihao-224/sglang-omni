@@ -127,6 +127,8 @@ def test_mimo_sglang_model_initializes_speech_embedding_modules() -> None:
     assert model.speech_embeddings[1].padding_idx == 5
     assert model.speech_group_downcast.in_features == 6
     assert model.speech_group_downcast.out_features == 7
+    assert model.hidden_states_downcast.in_features == 7
+    assert model.hidden_states_downcast.out_features == 3
 
 
 def test_mimo_model_embeds_grouped_audio_codes_with_zeroemb_mask() -> None:
@@ -566,7 +568,7 @@ def test_route_mimo_weight_name_classifies_checkpoint_prefixes() -> None:
     assert route_mimo_weight_name("speech_embeddings.0.weight") == "direct"
     assert route_mimo_weight_name("speech_group_downcast.weight") == "direct"
     assert route_mimo_weight_name("input_local_transformer.layers.0.weight") == "pending_mimo"
-    assert route_mimo_weight_name("hidden_states_downcast.weight") == "pending_mimo"
+    assert route_mimo_weight_name("hidden_states_downcast.weight") == "direct"
     assert route_mimo_weight_name("local_transformer.layers.0.weight") == "pending_mimo"
     assert route_mimo_weight_name("local_transformer_lm_heads.0.weight") == "pending_mimo"
     assert route_mimo_weight_name("unused.weight") == "unknown"
@@ -585,6 +587,14 @@ def test_mimo_model_load_weights_loads_supported_direct_modules() -> None:
             "speech_group_downcast.bias",
             torch.full_like(model.speech_group_downcast.bias, 4.5),
         ),
+        (
+            "hidden_states_downcast.weight",
+            torch.full_like(model.hidden_states_downcast.weight, 5.5),
+        ),
+        (
+            "hidden_states_downcast.bias",
+            torch.full_like(model.hidden_states_downcast.bias, 6.5),
+        ),
         ("unknown.weight", torch.tensor([1.0])),
     ]
 
@@ -595,11 +605,15 @@ def test_mimo_model_load_weights_loads_supported_direct_modules() -> None:
         "speech_embeddings.1.weight",
         "speech_group_downcast.weight",
         "speech_group_downcast.bias",
+        "hidden_states_downcast.weight",
+        "hidden_states_downcast.bias",
     }
     assert torch.equal(model.speech_embeddings[0].weight, torch.full_like(model.speech_embeddings[0].weight, 1.5))
     assert torch.equal(model.speech_embeddings[1].weight, torch.full_like(model.speech_embeddings[1].weight, 2.5))
     assert torch.equal(model.speech_group_downcast.weight, torch.full_like(model.speech_group_downcast.weight, 3.5))
     assert torch.equal(model.speech_group_downcast.bias, torch.full_like(model.speech_group_downcast.bias, 4.5))
+    assert torch.equal(model.hidden_states_downcast.weight, torch.full_like(model.hidden_states_downcast.weight, 5.5))
+    assert torch.equal(model.hidden_states_downcast.bias, torch.full_like(model.hidden_states_downcast.bias, 6.5))
 
 
 def test_mimo_model_load_weights_routes_language_model_when_built() -> None:

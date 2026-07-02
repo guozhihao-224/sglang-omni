@@ -22,10 +22,10 @@ _SUPPORTED_DIRECT_PREFIXES = (
     "lm_head.",
     "speech_embeddings.",
     "speech_group_downcast.",
+    "hidden_states_downcast.",
 )
 _PENDING_MIMO_PREFIXES = (
     "input_local_transformer.",
-    "hidden_states_downcast.",
     "local_transformer.",
     "local_transformer_lm_heads.",
 )
@@ -178,6 +178,10 @@ class MiMoV2ASRForCausalLM(nn.Module):
         self.speech_group_downcast = nn.Linear(
             self.group_size * input_local_dim,
             hidden_size,
+        )
+        self.hidden_states_downcast = nn.Linear(
+            hidden_size,
+            input_local_dim,
         )
 
     def build_language_model(self) -> nn.Module:
