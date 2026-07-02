@@ -7,7 +7,10 @@ from types import SimpleNamespace
 import torch
 
 from sglang_omni.models.mimo_asr.configuration_mimo_asr import MiMoV2ASRConfig
-from sglang_omni.models.mimo_asr.model_runner import build_mimo_decode_groups
+from sglang_omni.models.mimo_asr.model_runner import (
+    MiMoASROutputProcessor,
+    build_mimo_decode_groups,
+)
 from sglang_omni.models.mimo_asr.sglang_model import (
     MiMoInputLocalTransformer,
     MiMoLocalTransformer,
@@ -702,6 +705,25 @@ def test_mimo_decode_groups_helper_validates_shapes() -> None:
         assert "batch size" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("bad hidden batch size should fail")
+
+
+def test_mimo_asr_output_processor_preserves_grouped_ids() -> None:
+    processor = MiMoASROutputProcessor()
+    model_output = SimpleNamespace(
+        next_token_ids=torch.tensor([[1, 2, 3], [4, 5, 6]])
+    )
+    scheduler_output = SimpleNamespace(
+        requests=[
+            SimpleNamespace(request_id="r0"),
+            SimpleNamespace(request_id="r1"),
+        ]
+    )
+
+    outputs = processor.process(model_output, scheduler_output)
+
+    assert outputs["r0"].data == [1, 2, 3]
+    assert outputs["r1"].data == [4, 5, 6]
+    assert outputs["r0"].finished is False
 
 
 def test_mimo_model_build_decode_token_group_validates_speech_shape() -> None:

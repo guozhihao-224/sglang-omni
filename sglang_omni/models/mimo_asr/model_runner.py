@@ -15,6 +15,7 @@ from typing import Any
 import torch
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.scheduling.types import RequestOutput, SchedulerOutput
 
 
 class MiMoASRModelRunner(ModelRunner):
@@ -48,6 +49,41 @@ class MiMoASRModelRunner(ModelRunner):
             text_tail_token_id=text_tail_token_id,
         )
 
+
+class MiMoASROutputProcessor:
+    """Output processor for grouped MiMo decode ids.
+
+    Standard ASR processors expose one sampled token id per request. MiMo needs
+    to surface a flattened token group while preserving one scheduler row per
+    request. This processor is deliberately small and does not mutate SGLang
+    Req state by itself; scheduler integration must decide how to commit the
+    group to KV/request state.
+    """
+
+    def process(
+        self,
+        model_output: Any,
+        scheduler_output: SchedulerOutput,
+    ) -> dict[str, RequestOutput]:
+        groups = model_output.next_token_ids
+        if groups is None:
+            group_list: list[Any] = []
+        elif isinstance(groups, torch.Tensor):
+            group_list = groups.detach().cpu().tolist()
+        else:
+            group_list = groups
+
+        outputs: dict[str, RequestOutput] = {}
+        for row_idx, sched_req in enumerate(scheduler_output.requests):
+            data = group_list[row_idx] if row_idx < len(group_list) else None
+            outputs[sched_req.request_id] = RequestOutput(
+                request_id=sched_req.request_id,
+                data=data,
+                finished=False,
+            )
+        return outputs
+
+
 def build_mimo_decode_groups(
     model: Any,
     text_token_ids: torch.Tensor,
@@ -78,7 +114,9 @@ def build_mimo_decode_groups(
     groups: list[torch.Tensor] = []
     stopped: list[bool] = []
     for row_idx, token_id in enumerate(text_token_ids.tolist()):
-        row_hidden = None if hidden_rows is None else hidden_rows[row_idx : row_idx + 1]
+        row_hidden = (
+            None if hidden_rows is None else hidden_rows[row_idx : row_idx + 1]
+        )
         group, is_stopped = model.build_decode_step(
             int(token_id),
             row_hidden,
@@ -96,6 +134,7 @@ def build_mimo_decode_groups(
         dtype=torch.bool,
         device=text_token_ids.device,
     )
+
 
 def _normalize_hidden_rows(
     hidden_states: torch.Tensor | None,
@@ -118,4 +157,8 @@ def _normalize_hidden_rows(
     return hidden_states
 
 
-__all__ = ["MiMoASRModelRunner", "build_mimo_decode_groups"]
+__all__ = [
+    "MiMoASRModelRunner",
+    "MiMoASROutputProcessor",
+    "build_mimo_decode_groups",
+]

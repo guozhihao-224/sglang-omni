@@ -582,6 +582,12 @@ Standard SGLang `_sample_next_token_ids` (one text token per step) is **insuffic
 2. If token == 151667: `hidden_states_downcast` → `local_forward` → 8×`group_size` RVQ tokens.
 3. Else: fill speech rows with `speech_zeroemb_idx` per channel.
 4. Append `(text + speech) × group_size` flat tokens; check `MiMoStopper` on text slot.
+
+Implementation status: `mimo_asr/model_runner.py` now provides pure helpers to
+expand sampled text ids into per-request flat groups and an output processor that
+preserves grouped ids. The remaining runtime work is scheduler/backend commit:
+advance SGLang request/KV state by the whole flat group instead of assuming one
+token per request.
 5. Extract transcript from text row with stride `group_size` (see Flat Sequence Layout); strip special tokens.
 
 Reference vLLM-Omni `MiMoAudioLLMForConditionalGeneration.forward` for how to merge cached audio embeddings on decode steps where `input_ids == empty_token_id`.
