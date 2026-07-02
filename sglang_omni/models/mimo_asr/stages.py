@@ -46,6 +46,8 @@ def create_sglang_mimo_asr_executor(
     """Create a native MiMo-ASR scheduler wired like other ASR backends."""
 
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+    server_args_overrides = dict(server_args_overrides or {})
+    enable_async_decode = bool(server_args_overrides.pop("enable_async_decode", False))
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     audio_tokenizer = MiMoAudioTokenizerAdapter(
@@ -56,7 +58,6 @@ def create_sglang_mimo_asr_executor(
     defaults: dict[str, Any] = {
         "disable_cuda_graph": True,
         "disable_overlap_schedule": True,
-        "enable_async_decode": False,
         "enable_torch_compile": enable_torch_compile,
         "mem_fraction_static": mem_fraction_static,
         "max_prefill_tokens": 8192,
@@ -120,6 +121,7 @@ def create_sglang_mimo_asr_executor(
         request_builder=request_builder,
         result_adapter=result_adapter,
         post_batch_result_hook=commit_mimo_decode_groups_after_sglang,
+        enable_async_decode=enable_async_decode,
         request_build_max_workers=request_build_max_workers,
         request_build_max_pending=request_build_max_pending,
     )

@@ -231,10 +231,12 @@ def test_mimo_asr_stage_wires_native_scheduler_components(monkeypatch) -> None:
         max_running_requests=4,
         max_new_tokens=256,
         mm_embedding_cache_size_bytes=123,
+        server_args_overrides={"enable_async_decode": False},
     )
 
     assert build_kwargs["disable_cuda_graph"] is True
     assert build_kwargs["disable_overlap_schedule"] is True
+    assert "enable_async_decode" not in build_kwargs
     assert build_kwargs["max_running_requests"] == 4
     assert build_kwargs["max_prefill_tokens"] == 8192
     assert build_kwargs["chunked_prefill_size"] == 8192
@@ -254,6 +256,7 @@ def test_mimo_asr_stage_wires_native_scheduler_components(monkeypatch) -> None:
     assert scheduler.request_builder is request_builder
     assert scheduler.result_adapter is result_adapter
     assert scheduler.post_batch_result_hook is commit_mimo_decode_groups_after_sglang
+    assert scheduler.enable_async_decode is False
     assert scheduler.tp_worker.model_runner.model.return_hidden_states_output is True
     assert scheduler.model_runner.args == (scheduler.tp_worker, "mimo-output-processor")
     assert scheduler.model_runner.kwargs == {}
