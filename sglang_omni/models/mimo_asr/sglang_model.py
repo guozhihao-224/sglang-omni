@@ -927,9 +927,7 @@ class MiMoV2ASRForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             route = route_mimo_weight_name(name)
             if route == "language_model":
-                pending_language_weights.append(
-                    (name.removeprefix(_LANGUAGE_MODEL_PREFIX), loaded_weight)
-                )
+                pending_language_weights.append((name, loaded_weight))
                 continue
             if route == "pending_mimo":
                 pending_mimo_weights.append((name, loaded_weight))
@@ -947,10 +945,7 @@ class MiMoV2ASRForCausalLM(nn.Module):
             if self.language_model is None:
                 self.build_language_model()
             self.language_model.load_weights(pending_language_weights)
-            loaded.update(
-                f"{_LANGUAGE_MODEL_PREFIX}{name}"
-                for name, _ in pending_language_weights
-            )
+            loaded.update(name for name, _ in pending_language_weights)
 
         missing_mimo_prefixes: set[str] = set()
         for name, loaded_weight in pending_mimo_weights:

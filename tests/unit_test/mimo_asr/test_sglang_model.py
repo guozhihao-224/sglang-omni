@@ -1304,7 +1304,7 @@ def test_mimo_model_load_weights_routes_language_model_when_built() -> None:
 
     loaded = model.load_weights([("model.layers.0.weight", tensor)])
 
-    assert language_model.weights == [("layers.0.weight", tensor)]
+    assert language_model.weights == [("model.layers.0.weight", tensor)]
     assert loaded == {"model.layers.0.weight"}
 
 
@@ -1324,7 +1324,7 @@ def test_mimo_model_load_weights_builds_language_model_when_needed() -> None:
     loaded = model.load_weights([("model.layers.0.weight", tensor)])
 
     assert model.language_model is language_model
-    assert language_model.weights == [("layers.0.weight", tensor)]
+    assert language_model.weights == [("model.layers.0.weight", tensor)]
     assert loaded == {"model.layers.0.weight"}
 
 
