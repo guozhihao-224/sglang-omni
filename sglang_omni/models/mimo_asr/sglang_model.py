@@ -362,6 +362,28 @@ class MiMoV2ASRForCausalLM(nn.Module):
                 merged[position] = audio_hidden[row_idx]
         return merged
 
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        token_embedding: nn.Module,
+        items: list[Any] | None = None,
+    ) -> torch.Tensor:
+        """Embed text ids and optionally scatter MiMo audio embeddings."""
+
+        if input_ids.ndim != 1:
+            raise ValueError(
+                f"input_ids must be 1-D for MiMo-ASR prefill, got shape {tuple(input_ids.shape)}"
+            )
+        token_embeds = token_embedding(input_ids.to(dtype=torch.long))
+        if token_embeds.ndim != 2:
+            raise ValueError(
+                "token_embedding must return [seq_len, hidden_size], got "
+                f"shape {tuple(token_embeds.shape)}"
+            )
+        if not items:
+            return token_embeds
+        return self.merge_audio_embeds_into_token_embeds(token_embeds, items)
+
     @staticmethod
     def _ensure_item_pad_value(item: Any) -> None:
         if getattr(item, "pad_value", None) is not None:

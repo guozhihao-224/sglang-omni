@@ -478,3 +478,66 @@ def test_mimo_model_merge_audio_embeds_rejects_bad_token_embed_shape() -> None:
         assert "token_embeds" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("bad token embed shape should fail")
+
+
+def test_mimo_model_embed_input_ids_returns_text_embeddings_without_items() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=2))
+    token_embedding = torch.nn.Embedding(4, 2)
+    with torch.no_grad():
+        token_embedding.weight.copy_(
+            torch.tensor(
+                [
+                    [0.0, 0.0],
+                    [1.0, 10.0],
+                    [2.0, 20.0],
+                    [3.0, 30.0],
+                ]
+            )
+        )
+
+    embeds = model.embed_input_ids(torch.tensor([1, 2, 3]), token_embedding)
+
+    assert torch.equal(embeds, torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]))
+
+
+def test_mimo_model_embed_input_ids_scatters_audio_items() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+    token_embedding = torch.nn.Embedding(4, 1)
+    with torch.no_grad():
+        token_embedding.weight.copy_(torch.tensor([[0.0], [1.0], [2.0], [3.0]]))
+        for embedding in model.speech_embeddings:
+            embedding.weight.fill_(1.0)
+        model.speech_group_downcast.weight.fill_(1.0)
+        model.speech_group_downcast.bias.zero_()
+    item = _FakeMMItem(torch.tensor([[0, 0], [1, 1]]), offsets=[(1, 1)])
+
+    embeds = model.embed_input_ids(torch.tensor([1, 2, 3]), token_embedding, [item])
+
+    assert torch.equal(embeds, torch.tensor([[1.0], [12.0], [3.0]]))
+
+
+def test_mimo_model_embed_input_ids_validates_input_shape() -> None:
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+    token_embedding = torch.nn.Embedding(4, 1)
+
+    try:
+        model.embed_input_ids(torch.zeros(1, 2, dtype=torch.long), token_embedding)
+    except ValueError as exc:
+        assert "input_ids" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad input_ids shape should fail")
+
+
+def test_mimo_model_embed_input_ids_validates_embedding_shape() -> None:
+    class _BadEmbedding(torch.nn.Module):
+        def forward(self, input_ids):
+            return torch.zeros(input_ids.shape[0], 1, 1)
+
+    model = MiMoV2ASRForCausalLM(_tiny_config(hidden_size=1))
+
+    try:
+        model.embed_input_ids(torch.tensor([1, 2]), _BadEmbedding())
+    except ValueError as exc:
+        assert "token_embedding" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("bad token embedding shape should fail")
