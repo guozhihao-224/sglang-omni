@@ -26,10 +26,10 @@ class _CapturedEncoderGraph(NamedTuple):
 class MossTranscribeDiarizeEncoderCudaGraphRunner:
     """Lazy-captured CUDA graphs for fixed-window Whisper encoder batches.
 
-    Graphs are keyed by ``(batch_size, feature_len)``. A replay copies the live
-    input features into the captured static buffer, replays the graph, and returns
-    the static output buffer. Callers must consume/copy the result before a later
-    replay of the same shape overwrites it.
+    Graphs are keyed by ``(batch_size, n_mels, feature_len)``. A replay copies
+    the live input features into the captured static buffer, replays the graph,
+    and returns the static output buffer. Callers must consume/copy the result
+    before a later replay of the same shape overwrites it.
     """
 
     def __init__(
@@ -48,11 +48,11 @@ class MossTranscribeDiarizeEncoderCudaGraphRunner:
         self._max_graphs = int(max_graphs)
         self._warmup_iters = int(warmup_iters)
         self._min_free_bytes = int(float(min_free_gb) * 1024**3)
-        self._graphs: dict[tuple[int, int], _CapturedEncoderGraph] = {}
-        self._failed_shapes: set[tuple[int, int]] = set()
+        self._graphs: dict[tuple[int, int, int], _CapturedEncoderGraph] = {}
+        self._failed_shapes: set[tuple[int, int, int]] = set()
         self._pool = None
 
-    def captured_shapes(self) -> list[tuple[int, int]]:
+    def captured_shapes(self) -> list[tuple[int, int, int]]:
         return sorted(self._graphs.keys())
 
     def _bucket_batch_size(self, batch_size: int) -> int | None:
@@ -73,6 +73,7 @@ class MossTranscribeDiarizeEncoderCudaGraphRunner:
         self,
         *,
         batch_size: int,
+        n_mels: int,
         feature_len: int,
         encoder_position_ids: torch.Tensor,
         forward_batch,
@@ -81,9 +82,10 @@ class MossTranscribeDiarizeEncoderCudaGraphRunner:
     ) -> None:
         if len(self._graphs) >= self._max_graphs:
             logger.warning(
-                "MOSS-TD encoder CG cap %d reached; serving eager for B=%d T=%d",
+                "MOSS-TD encoder CG cap %d reached; serving eager for B=%d M=%d T=%d",
                 self._max_graphs,
                 batch_size,
+                n_mels,
                 feature_len,
             )
             return
@@ -92,15 +94,15 @@ class MossTranscribeDiarizeEncoderCudaGraphRunner:
         if not enough:
             logger.warning(
                 "MOSS-TD encoder CG: free VRAM %.1fGB < %.1fGB headroom; "
-                "eager for B=%d T=%d",
+                "eager for B=%d M=%d T=%d",
                 free / 1024**3,
                 self._min_free_bytes / 1024**3,
                 batch_size,
+                n_mels,
                 feature_len,
             )
             return
 
-        n_mels = int(getattr(self._whisper_encoder.config, "num_mel_bins", 80))
         static_input_features = torch.zeros(
             (batch_size, n_mels, feature_len), dtype=dtype, device=device
         )
@@ -132,7 +134,7 @@ class MossTranscribeDiarizeEncoderCudaGraphRunner:
                 forward_batch,
             )
 
-        self._graphs[(batch_size, feature_len)] = _CapturedEncoderGraph(
+        self._graphs[(batch_size, n_mels, feature_len)] = _CapturedEncoderGraph(
             graph=graph,
             static_input_features=static_input_features,
             static_encoder_position_ids=static_encoder_position_ids,
@@ -141,8 +143,9 @@ class MossTranscribeDiarizeEncoderCudaGraphRunner:
             feature_len=feature_len,
         )
         logger.info(
-            "Captured MOSS-TD encoder CUDA graph B=%d T=%d -> %s (%d cached)",
+            "Captured MOSS-TD encoder CUDA graph B=%d M=%d T=%d -> %s (%d cached)",
             batch_size,
+            n_mels,
             feature_len,
             tuple(static_output.shape),
             len(self._graphs),
@@ -161,12 +164,13 @@ class MossTranscribeDiarizeEncoderCudaGraphRunner:
             return None
 
         live_batch_size = int(input_features.shape[0])
+        n_mels = int(input_features.shape[1])
         feature_len = int(input_features.shape[-1])
         batch_size = self._bucket_batch_size(live_batch_size)
         if batch_size is None:
             return None
 
-        shape = (batch_size, feature_len)
+        shape = (batch_size, n_mels, feature_len)
         entry = self._graphs.get(shape)
         if entry is None:
             if shape in self._failed_shapes:
@@ -175,6 +179,7 @@ class MossTranscribeDiarizeEncoderCudaGraphRunner:
                 with torch.cuda.device(input_features.device):
                     self._capture_shape(
                         batch_size=batch_size,
+                        n_mels=n_mels,
                         feature_len=feature_len,
                         encoder_position_ids=encoder_position_ids,
                         forward_batch=forward_batch,
@@ -185,9 +190,10 @@ class MossTranscribeDiarizeEncoderCudaGraphRunner:
                 self._graphs.pop(shape, None)
                 self._failed_shapes.add(shape)
                 logger.warning(
-                    "MOSS-TD encoder CG capture failed for B=%d T=%d: %s; "
+                    "MOSS-TD encoder CG capture failed for B=%d M=%d T=%d: %s; "
                     "serving eager",
                     batch_size,
+                    n_mels,
                     feature_len,
                     exc,
                 )
