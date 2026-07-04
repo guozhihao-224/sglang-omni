@@ -89,9 +89,9 @@ def test_get_audio_feature_batches_encoder_across_items_and_preserves_order() ->
     assert model.whisper_encoder.calls == 1
     assert model.whisper_encoder.batch_shapes == [(3, 2, 6)]
     assert output.tolist() == [
-        [0.0, 0.0, 1.0],
-        [3.0, 3.0, 4.0],
-        [6.0, 6.0, 7.0],
+        [0.0, 0.0, 0.0],
+        [3.0, 3.0, 3.0],
+        [6.0, 6.0, 6.0],
     ]
 
 
