@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
@@ -30,6 +31,33 @@ from sglang_omni.models.moss_transcribe_diarize.hf_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+_PROFILE_ENV = "SGLANG_OMNI_MOSS_TD_PROFILE"
+_PROFILE_LIMIT_ENV = "SGLANG_OMNI_MOSS_TD_PROFILE_LIMIT"
+
+
+def _profile_enabled() -> bool:
+    return os.environ.get(_PROFILE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _profile_limit(default: int = 32) -> int:
+    raw = os.environ.get(_PROFILE_LIMIT_ENV)
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _sync_if_cuda(tensor: torch.Tensor) -> None:
+    if tensor.device.type == "cuda":
+        torch.cuda.synchronize(tensor.device)
 
 
 class VQAdaptor(nn.Module):
@@ -85,6 +113,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         )
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         self._audio_encoder_compiled = False
+        self._audio_profile_count = 0
 
     def compile_audio_encoder(
         self,
@@ -138,7 +167,32 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
 
         device = next(self.whisper_encoder.parameters()).device
         encoder_dtype = next(self.whisper_encoder.parameters()).dtype
+
+        profile = (
+            _profile_enabled() and self._audio_profile_count < _profile_limit()
+        )
+        if profile:
+            self._audio_profile_count += 1
+            t_start = time.perf_counter()
+            t_last = t_start
+
+            def mark(label: str) -> float:
+                nonlocal t_last
+                del label
+                now = time.perf_counter()
+                elapsed_ms = (now - t_last) * 1000.0
+                t_last = now
+                return elapsed_ms
+
+        else:
+            t_start = 0.0
+
         input_features = item.feature.to(device=device, dtype=encoder_dtype)
+        if profile:
+            _sync_if_cuda(input_features)
+            input_to_device_ms = mark("input_to_device")
+        else:
+            input_to_device_ms = 0.0
 
         audio_feature_lengths = getattr(item, "audio_feature_lengths", None)
         if audio_feature_lengths is None:
@@ -166,6 +220,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
                 f"chunk: got {audio_chunk_mapping.numel()} indices for "
                 f"{input_features.shape[0]} chunks."
             )
+        metadata_ms = mark("metadata") if profile else 0.0
 
         encoder_len = (input_features.shape[-1] - 1) // 2 + 1
         encoder_position_ids = torch.arange(
@@ -173,11 +228,21 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             device=input_features.device,
             dtype=torch.long,
         )
+        if profile:
+            _sync_if_cuda(encoder_position_ids)
+            position_ids_ms = mark("position_ids")
+        else:
+            position_ids_ms = 0.0
         whisper_features = self.whisper_encoder(
             input_features,
             encoder_position_ids,
             forward_batch,
         )
+        if profile:
+            _sync_if_cuda(whisper_features)
+            whisper_encoder_ms = mark("whisper_encoder")
+        else:
+            whisper_encoder_ms = 0.0
 
         audio_feature_lengths_list = audio_feature_lengths.tolist()
         audio_chunk_mapping_list = audio_chunk_mapping.tolist()
@@ -193,6 +258,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
                     chunk_idx : chunk_idx + 1, : int(token_len) * merge_size
                 ]
             )
+        chunk_pack_ms = mark("chunk_pack") if profile else 0.0
 
         adapted = []
         adaptor_dtype = next(self.vq_adaptor.parameters()).dtype
@@ -202,6 +268,32 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             feat = torch.cat(parts, dim=1).to(dtype=adaptor_dtype)
             merged = self.time_merge(feat)
             adapted.append(self.vq_adaptor(merged).squeeze(0))
+        if profile:
+            if adapted:
+                _sync_if_cuda(adapted[-1])
+            adaptor_ms = mark("adaptor")
+            total_ms = (time.perf_counter() - t_start) * 1000.0
+            logger.info(
+                "[moss-td-profile] audio_encode total_ms=%.3f "
+                "input_to_device_ms=%.3f metadata_ms=%.3f "
+                "position_ids_ms=%.3f whisper_encoder_ms=%.3f "
+                "chunk_pack_ms=%.3f adaptor_ms=%.3f "
+                "compiled=%s chunks=%d input_shape=%s encoder_len=%d "
+                "num_audios=%d output_tokens=%d",
+                total_ms,
+                input_to_device_ms,
+                metadata_ms,
+                position_ids_ms,
+                whisper_encoder_ms,
+                chunk_pack_ms,
+                adaptor_ms,
+                self._audio_encoder_compiled,
+                int(input_features.shape[0]),
+                tuple(input_features.shape),
+                encoder_len,
+                num_audios,
+                sum(int(x.shape[0]) for x in adapted),
+            )
         return adapted
 
     def get_audio_feature(

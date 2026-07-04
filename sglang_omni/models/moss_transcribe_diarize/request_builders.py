@@ -7,6 +7,7 @@ import base64
 import hashlib
 import io
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -28,6 +29,9 @@ from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
 logger = logging.getLogger(__name__)
 
+_PROFILE_ENV = "SGLANG_OMNI_MOSS_TD_PROFILE"
+_PROFILE_LIMIT_ENV = "SGLANG_OMNI_MOSS_TD_PROFILE_LIMIT"
+
 _SAMPLE_RATE = 16000
 _AUDIO_PAD = "<|audio_pad|>"
 _AUDIO_START = "<|audio_start|>"
@@ -42,6 +46,25 @@ DEFAULT_TRANSCRIBE_DIARIZE_PROMPT = (
     "（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，"
     "并在段末标注结束时间戳，以清晰标明该段语音范围。"
 )
+
+
+def _profile_enabled() -> bool:
+    return os.environ.get(_PROFILE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _profile_limit(default: int = 32) -> int:
+    raw = os.environ.get(_PROFILE_LIMIT_ENV)
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
 
 
 @dataclass
@@ -261,13 +284,34 @@ def make_moss_transcribe_diarize_scheduler_adapters(
     audio_end_id = int(tokenizer.convert_tokens_to_ids(_AUDIO_END))
     eos_token_id = int(tokenizer.eos_token_id)
     vocab_size = int(tokenizer.vocab_size)
+    profile_count = 0
 
     def request_builder(payload: StagePayload) -> MossTranscribeDiarizeRequestData:
+        nonlocal profile_count
+        profile = _profile_enabled() and profile_count < _profile_limit()
+        if profile:
+            profile_count += 1
+            t_start = time.perf_counter()
+            t_last = t_start
+
+            def mark(label: str) -> float:
+                nonlocal t_last
+                now = time.perf_counter()
+                elapsed_ms = (now - t_last) * 1000.0
+                t_last = now
+                return elapsed_ms
+
+        else:
+            t_start = 0.0
+
         params = payload.request.params or {}
         audio = load_audio(_audio_source_from_payload(payload))
+        load_audio_ms = mark("load_audio") if profile else 0.0
         audio_duration_s = float(len(audio) / _SAMPLE_RATE)
         fingerprint = _audio_fingerprint(audio)
+        fingerprint_ms = mark("fingerprint") if profile else 0.0
         prompt = _prompt_from_payload(payload, processor)
+        prompt_ms = mark("prompt") if profile else 0.0
 
         encoded = processor(
             text=prompt,
@@ -275,10 +319,12 @@ def make_moss_transcribe_diarize_scheduler_adapters(
             return_tensors="pt",
             max_length=int(params.get("max_length") or 131072),
         )
+        processor_ms = mark("processor") if profile else 0.0
         input_ids = encoded["input_ids"][0].tolist()
         features = encoded["input_features"]
         audio_feature_lengths = encoded["audio_feature_lengths"]
         audio_chunk_mapping = encoded["audio_chunk_mapping"]
+        tensor_extract_ms = mark("tensor_extract") if profile else 0.0
 
         offsets = _contiguous_offsets(input_ids, audio_token_id)
         if not offsets:
@@ -300,6 +346,7 @@ def make_moss_transcribe_diarize_scheduler_adapters(
             audio_item.pad_value if token_id == audio_token_id else token_id
             for token_id in input_ids
         ]
+        input_pack_ms = mark("input_pack") if profile else 0.0
 
         mm_inputs = MultimodalInputs(
             mm_items=[audio_item],
@@ -329,6 +376,28 @@ def make_moss_transcribe_diarize_scheduler_adapters(
         )
         req.multimodal_inputs = mm_inputs
         req._codec_suppress_tokens = None
+        request_pack_ms = mark("request_pack") if profile else 0.0
+
+        if profile:
+            total_ms = (time.perf_counter() - t_start) * 1000.0
+            logger.info(
+                "[moss-td-profile] request_build rid=%s total_ms=%.3f "
+                "load_audio_ms=%.3f fingerprint_ms=%.3f prompt_ms=%.3f "
+                "processor_ms=%.3f tensor_extract_ms=%.3f input_pack_ms=%.3f "
+                "request_pack_ms=%.3f audio_s=%.3f chunks=%d prompt_tokens=%d",
+                payload.request_id,
+                total_ms,
+                load_audio_ms,
+                fingerprint_ms,
+                prompt_ms,
+                processor_ms,
+                tensor_extract_ms,
+                input_pack_ms,
+                request_pack_ms,
+                audio_duration_s,
+                int(audio_feature_lengths.numel()),
+                len(padded_input_ids),
+            )
 
         logger.debug(
             "[moss-td] prompt_tokens=%d audio_tokens=%d chunks=%d duration=%.3fs",
