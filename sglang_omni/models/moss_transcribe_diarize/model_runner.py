@@ -64,7 +64,7 @@ class MossTranscribeDiarizeModelRunner(ModelRunner):
 
         if not all_audio_items or audio_row_indices.numel() == 0:
             if all_audio_items:
-                logger.info(
+                logger.debug(
                     "[moss-td] prefill_audio_batch reqs=%d items=%d audio_rows=0 "
                     "skip_encoder=True",
                     len(requests),
@@ -100,7 +100,7 @@ class MossTranscribeDiarizeModelRunner(ModelRunner):
             )
         input_embeds[audio_row_indices] = audio_embeds[audio_embed_indices]
 
-        logger.info(
+        logger.debug(
             "[moss-td] prefill_audio_batch reqs=%d items=%d audio_rows=%d",
             len(requests),
             len(all_audio_items),

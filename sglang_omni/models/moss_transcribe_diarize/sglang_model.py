@@ -264,7 +264,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             total_chunks += int(input_features.shape[0])
 
         if len(items) > 1:
-            logger.info(
+            logger.debug(
                 "[moss-td] audio_encoder_batch items=%d chunks=%d max_frames=%d "
                 "total_frames=%d padded_frames=%d",
                 len(items),
