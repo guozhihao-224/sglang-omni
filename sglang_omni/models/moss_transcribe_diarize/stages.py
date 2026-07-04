@@ -8,9 +8,11 @@ from typing import Any
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from transformers import AutoConfig, AutoProcessor, GenerationConfig
 
-from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_transcribe_diarize import (  # noqa: F401
     hf_config as _hf_config,
+)
+from sglang_omni.models.moss_transcribe_diarize.model_runner import (
+    MossTranscribeDiarizeModelRunner,
 )
 from sglang_omni.models.moss_transcribe_diarize.request_builders import (
     make_moss_transcribe_diarize_scheduler_adapters,
@@ -140,7 +142,7 @@ def create_sglang_moss_transcribe_diarize_executor(
         model_config=model_config,
         prefill_manager=prefill_mgr,
         decode_manager=decode_mgr,
-        model_runner=ModelRunner(model_worker, output_proc),
+        model_runner=MossTranscribeDiarizeModelRunner(model_worker, output_proc),
         request_builder=request_builder,
         result_adapter=result_adapter,
         request_build_max_workers=request_build_max_workers,

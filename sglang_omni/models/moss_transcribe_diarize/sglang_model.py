@@ -104,7 +104,78 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         item: MultimodalDataItem,
         forward_batch: ForwardBatch,
     ) -> list[torch.Tensor]:
-        return self._encode_audio_items_batched([item], forward_batch)
+        if item.feature is None:
+            raise ValueError(
+                "MOSS-Transcribe-Diarize audio item is missing input_features."
+            )
+
+        device = next(self.whisper_encoder.parameters()).device
+        encoder_dtype = next(self.whisper_encoder.parameters()).dtype
+        input_features = item.feature.to(device=device, dtype=encoder_dtype)
+
+        audio_feature_lengths = getattr(item, "audio_feature_lengths", None)
+        if audio_feature_lengths is None:
+            raise ValueError(
+                "MOSS-Transcribe-Diarize audio item is missing audio_feature_lengths."
+            )
+        audio_feature_lengths = audio_feature_lengths.to(device="cpu", dtype=torch.long)
+        if audio_feature_lengths.numel() != input_features.shape[0]:
+            raise ValueError(
+                "audio_feature_lengths must contain one length per input_features "
+                f"chunk: got {audio_feature_lengths.numel()} lengths for "
+                f"{input_features.shape[0]} chunks."
+            )
+
+        audio_chunk_mapping = getattr(item, "audio_chunk_mapping", None)
+        if audio_chunk_mapping is None:
+            audio_chunk_mapping = torch.zeros(
+                input_features.shape[0], dtype=torch.long, device="cpu"
+            )
+        else:
+            audio_chunk_mapping = audio_chunk_mapping.to(device="cpu", dtype=torch.long)
+        if audio_chunk_mapping.numel() != input_features.shape[0]:
+            raise ValueError(
+                "audio_chunk_mapping must contain one sample index per input_features "
+                f"chunk: got {audio_chunk_mapping.numel()} indices for "
+                f"{input_features.shape[0]} chunks."
+            )
+
+        encoder_len = (input_features.shape[-1] - 1) // 2 + 1
+        encoder_position_ids = torch.arange(
+            encoder_len,
+            device=input_features.device,
+            dtype=torch.long,
+        )
+        whisper_features = self.whisper_encoder(
+            input_features,
+            encoder_position_ids,
+            forward_batch,
+        )
+
+        audio_feature_lengths_list = audio_feature_lengths.tolist()
+        audio_chunk_mapping_list = audio_chunk_mapping.tolist()
+        num_audios = (
+            max(audio_chunk_mapping_list) + 1 if audio_chunk_mapping_list else 0
+        )
+        per_audio_chunks = [[] for _ in range(num_audios)]
+        merge_size = int(self.config.audio_merge_size)
+        for chunk_idx, token_len in enumerate(audio_feature_lengths_list):
+            sample_idx = audio_chunk_mapping_list[chunk_idx]
+            per_audio_chunks[sample_idx].append(
+                whisper_features[
+                    chunk_idx : chunk_idx + 1, : int(token_len) * merge_size
+                ]
+            )
+
+        adapted = []
+        adaptor_dtype = next(self.vq_adaptor.parameters()).dtype
+        for parts in per_audio_chunks:
+            if not parts:
+                continue
+            feat = torch.cat(parts, dim=1).to(dtype=adaptor_dtype)
+            merged = self.time_merge(feat)
+            adapted.append(self.vq_adaptor(merged).squeeze(0))
+        return adapted
 
     def _empty_audio_features(self) -> torch.Tensor:
         hidden_size = self.config.text_config.hidden_size
@@ -192,15 +263,16 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             )
             total_chunks += int(input_features.shape[0])
 
-        logger.info(
-            "[moss-td] audio_encoder_batch items=%d chunks=%d max_frames=%d "
-            "total_frames=%d padded_frames=%d",
-            len(items),
-            total_chunks,
-            max_feature_len,
-            total_feature_frames,
-            total_chunks * max_feature_len,
-        )
+        if len(items) > 1:
+            logger.info(
+                "[moss-td] audio_encoder_batch items=%d chunks=%d max_frames=%d "
+                "total_frames=%d padded_frames=%d",
+                len(items),
+                total_chunks,
+                max_feature_len,
+                total_feature_frames,
+                total_chunks * max_feature_len,
+            )
 
         padded_features = []
         flat_chunk_refs: list[tuple[int, int]] = []
@@ -264,7 +336,10 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         items: List[MultimodalDataItem],
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        audio_embeds = self._encode_audio_items_batched(items, forward_batch)
+        if len(items) == 1:
+            audio_embeds = self._encode_one_audio_item(items[0], forward_batch)
+        else:
+            audio_embeds = self._encode_audio_items_batched(items, forward_batch)
         if not audio_embeds:
             return self._empty_audio_features()
         return torch.cat(audio_embeds, dim=0)
@@ -274,8 +349,19 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor | None = None,
+        input_embeds_are_projected: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
+        del input_embeds_are_projected
+        if input_embeds is not None:
+            return self.language_model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+            )
+
         return general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
