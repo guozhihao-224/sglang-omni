@@ -127,6 +127,8 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         audio_feature_lengths_per_item = []
         audio_chunk_mapping_per_item = []
         max_feature_len = 0
+        total_feature_frames = 0
+        total_chunks = 0
         num_mel_bins: int | None = None
 
         for item in items:
@@ -185,6 +187,20 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             audio_feature_lengths_per_item.append(audio_feature_lengths)
             audio_chunk_mapping_per_item.append(audio_chunk_mapping)
             max_feature_len = max(max_feature_len, int(input_features.shape[-1]))
+            total_feature_frames += int(input_features.shape[0]) * int(
+                input_features.shape[-1]
+            )
+            total_chunks += int(input_features.shape[0])
+
+        logger.info(
+            "[moss-td] audio_encoder_batch items=%d chunks=%d max_frames=%d "
+            "total_frames=%d padded_frames=%d",
+            len(items),
+            total_chunks,
+            max_feature_len,
+            total_feature_frames,
+            total_chunks * max_feature_len,
+        )
 
         padded_features = []
         flat_chunk_refs: list[tuple[int, int]] = []
