@@ -60,6 +60,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     enable_torch_compile: bool = False,
     enable_encoder_torch_compile: bool = False,
     encoder_torch_compile_mode: str | None = None,
+    enable_true_length_audio_features: bool = False,
     request_build_max_workers: int = 2,
     request_build_max_pending: int | None = 16,
     server_args_overrides: dict[str, Any] | None = None,
@@ -135,6 +136,8 @@ def create_sglang_moss_transcribe_diarize_executor(
         processor=processor,
         tokenizer=tokenizer,
         max_new_tokens=resolved_max_new_tokens,
+        enable_true_length_audio_features=enable_true_length_audio_features,
+        audio_merge_size=int(getattr(model.config, "audio_merge_size", 4)),
     )
 
     return OmniScheduler(

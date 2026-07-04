@@ -31,6 +31,7 @@ class MossTranscribeDiarizePipelineConfig(PipelineConfig):
                 "request_build_max_workers": 2,
                 "request_build_max_pending": 16,
                 "enable_encoder_torch_compile": False,
+                "enable_true_length_audio_features": False,
             },
             gpu=0,
             terminal=True,

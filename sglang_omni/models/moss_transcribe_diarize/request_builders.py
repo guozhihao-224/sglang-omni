@@ -268,10 +268,35 @@ def _contiguous_offsets(input_ids: list[int], token_id: int) -> list[tuple[int, 
     return offsets
 
 
+def _trim_features_to_audio_lengths(
+    features: torch.Tensor,
+    audio_feature_lengths: torch.Tensor,
+    *,
+    audio_merge_size: int,
+) -> torch.Tensor:
+    if audio_feature_lengths.numel() == 0:
+        return features
+    max_audio_tokens = int(audio_feature_lengths.max().item())
+    if max_audio_tokens <= 0:
+        return features
+
+    # MOSS-TD consumes Whisper encoder frames before time_merge. Each generated
+    # audio token represents ``audio_merge_size`` encoder frames, and the
+    # SGLang Whisper encoder maps mel frames to ``ceil(mel_frames / 2)`` frames.
+    required_mel_frames = max_audio_tokens * int(audio_merge_size) * 2
+    required_mel_frames = min(int(features.shape[-1]), max(1, required_mel_frames))
+    if required_mel_frames >= features.shape[-1]:
+        return features
+    return features[..., :required_mel_frames].contiguous()
+
+
 def make_moss_transcribe_diarize_scheduler_adapters(
     processor: Any,
     tokenizer: Any,
     max_new_tokens: int,
+    *,
+    enable_true_length_audio_features: bool = False,
+    audio_merge_size: int = 4,
 ) -> tuple[
     Callable[[StagePayload], MossTranscribeDiarizeRequestData],
     Callable[[Any], StagePayload],
@@ -324,6 +349,14 @@ def make_moss_transcribe_diarize_scheduler_adapters(
         features = encoded["input_features"]
         audio_feature_lengths = encoded["audio_feature_lengths"]
         audio_chunk_mapping = encoded["audio_chunk_mapping"]
+        original_feature_frames = int(features.shape[-1])
+        if enable_true_length_audio_features:
+            features = _trim_features_to_audio_lengths(
+                features,
+                audio_feature_lengths,
+                audio_merge_size=audio_merge_size,
+            )
+        trimmed_feature_frames = int(features.shape[-1])
         tensor_extract_ms = mark("tensor_extract") if profile else 0.0
 
         offsets = _contiguous_offsets(input_ids, audio_token_id)
@@ -398,6 +431,19 @@ def make_moss_transcribe_diarize_scheduler_adapters(
                 int(audio_feature_lengths.numel()),
                 len(padded_input_ids),
             )
+            if enable_true_length_audio_features:
+                logger.info(
+                    "[moss-td-profile] true_length_features rid=%s "
+                    "original_frames=%d trimmed_frames=%d audio_merge_size=%d "
+                    "max_audio_tokens=%d",
+                    payload.request_id,
+                    original_feature_frames,
+                    trimmed_feature_frames,
+                    int(audio_merge_size),
+                    int(audio_feature_lengths.max().item())
+                    if audio_feature_lengths.numel()
+                    else 0,
+                )
 
         logger.debug(
             "[moss-td] prompt_tokens=%d audio_tokens=%d chunks=%d duration=%.3fs",
