@@ -62,7 +62,14 @@ class MossTranscribeDiarizeModelRunner(ModelRunner):
             dtype=model_dtype
         )
 
-        if not all_audio_items:
+        if not all_audio_items or audio_row_indices.numel() == 0:
+            if all_audio_items:
+                logger.info(
+                    "[moss-td] prefill_audio_batch reqs=%d items=%d audio_rows=0 "
+                    "skip_encoder=True",
+                    len(requests),
+                    len(all_audio_items),
+                )
             return input_embeds
 
         audio_pieces = self.model._encode_audio_items_batched(
