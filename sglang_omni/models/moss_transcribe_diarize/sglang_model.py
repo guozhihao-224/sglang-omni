@@ -34,6 +34,12 @@ logger = logging.getLogger(__name__)
 
 _PROFILE_ENV = "SGLANG_OMNI_MOSS_TD_PROFILE"
 _PROFILE_LIMIT_ENV = "SGLANG_OMNI_MOSS_TD_PROFILE_LIMIT"
+_COMPILE_TARGET_ALIASES = {
+    "encoder": "whisper",
+    "vq_adaptor": "adaptor",
+    "vq-adaptor": "adaptor",
+    "adapter": "adaptor",
+}
 
 
 def _profile_enabled() -> bool:
@@ -58,6 +64,38 @@ def _profile_limit(default: int = 32) -> int:
 def _sync_if_cuda(tensor: torch.Tensor) -> None:
     if tensor.device.type == "cuda":
         torch.cuda.synchronize(tensor.device)
+
+
+def _normalize_compile_targets(target: str | Iterable[str] | None) -> tuple[str, ...]:
+    if target is None:
+        return ("whisper",)
+    if isinstance(target, str):
+        raw_targets = [part.strip() for part in target.split(",")]
+    else:
+        raw_targets = [str(part).strip() for part in target]
+
+    targets: list[str] = []
+    for raw_target in raw_targets:
+        if not raw_target:
+            continue
+        normalized = raw_target.lower().replace("-", "_")
+        normalized = _COMPILE_TARGET_ALIASES.get(normalized, normalized)
+        if normalized in {"none", "off", "false", "0"}:
+            continue
+        if normalized not in {"whisper", "whisper_layers", "adaptor"}:
+            raise ValueError(
+                "Unsupported MOSS-Transcribe-Diarize encoder torch.compile "
+                f"target {raw_target!r}; expected one of "
+                "'whisper', 'whisper_layers', 'adaptor'."
+            )
+        if normalized not in targets:
+            targets.append(normalized)
+    if "whisper" in targets and "whisper_layers" in targets:
+        raise ValueError(
+            "encoder_torch_compile_target cannot combine 'whisper' and "
+            "'whisper_layers'; choose one Whisper compile boundary."
+        )
+    return tuple(targets)
 
 
 class VQAdaptor(nn.Module):
@@ -113,6 +151,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         )
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         self._audio_encoder_compiled = False
+        self._audio_compile_targets: set[str] = set()
         self._audio_profile_count = 0
 
     def compile_audio_encoder(
@@ -120,25 +159,66 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         *,
         mode: str | None = None,
         dynamic: bool = True,
+        target: str | Iterable[str] | None = None,
     ) -> None:
-        if self._audio_encoder_compiled:
+        targets = _normalize_compile_targets(target)
+        if not targets:
+            return
+        if set(targets).issubset(self._audio_compile_targets):
             return
 
         from sglang.srt.model_executor.cuda_graph_runner import set_torch_compile_config
 
         set_torch_compile_config()
         compile_mode = mode or os.environ.get("SGLANG_TORCH_COMPILE_MODE", "default")
-        self.whisper_encoder = torch.compile(
-            self.whisper_encoder,
-            mode=compile_mode,
-            dynamic=dynamic,
-        )
+        compiled: list[str] = []
+        for compile_target in targets:
+            if compile_target in self._audio_compile_targets:
+                continue
+            if compile_target == "whisper":
+                self.whisper_encoder = torch.compile(
+                    self.whisper_encoder,
+                    mode=compile_mode,
+                    dynamic=dynamic,
+                )
+            elif compile_target == "whisper_layers":
+                self._compile_whisper_layers(mode=compile_mode, dynamic=dynamic)
+            elif compile_target == "adaptor":
+                self.vq_adaptor = torch.compile(
+                    self.vq_adaptor,
+                    mode=compile_mode,
+                    dynamic=dynamic,
+                )
+            else:
+                raise AssertionError(f"unexpected compile target {compile_target!r}")
+            self._audio_compile_targets.add(compile_target)
+            compiled.append(compile_target)
         self._audio_encoder_compiled = True
         logger.info(
-            "Compiled MOSS-Transcribe-Diarize Whisper encoder "
+            "Compiled MOSS-Transcribe-Diarize audio path targets=%s "
             "(mode=%s, dynamic=%s)",
+            ",".join(compiled),
             compile_mode,
             dynamic,
+        )
+
+    def _compile_whisper_layers(self, *, mode: str, dynamic: bool) -> None:
+        layers = getattr(self.whisper_encoder, "layers", None)
+        if layers is None:
+            raise AttributeError(
+                "MOSS-Transcribe-Diarize whisper_encoder has no 'layers' attribute; "
+                "cannot use encoder_torch_compile_target='whisper_layers'."
+            )
+        if not isinstance(layers, nn.ModuleList):
+            raise TypeError(
+                "MOSS-Transcribe-Diarize whisper_encoder.layers must be an "
+                f"nn.ModuleList, got {type(layers)!r}."
+            )
+        for idx, layer in enumerate(layers):
+            layers[idx] = torch.compile(layer, mode=mode, dynamic=dynamic)
+        logger.info(
+            "Compiled %d MOSS-Transcribe-Diarize Whisper encoder layers",
+            len(layers),
         )
 
     def get_input_embeddings(self):
