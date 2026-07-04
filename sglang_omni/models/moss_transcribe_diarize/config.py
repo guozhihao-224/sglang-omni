@@ -30,6 +30,11 @@ class MossTranscribeDiarizePipelineConfig(PipelineConfig):
                 "max_running_requests": 16,
                 "request_build_max_workers": 2,
                 "request_build_max_pending": 16,
+                # Keep adapted audio embeddings cached across chunked-prefill
+                # steps; without it every 4k-token prefill chunk of a long
+                # request re-runs the whole Whisper encoder (a 90-minute audio
+                # spans ~17 chunks and its embedding is ~138MB in bf16).
+                "mm_embedding_cache_size_bytes": 1 << 30,
             },
             gpu=0,
             terminal=True,
