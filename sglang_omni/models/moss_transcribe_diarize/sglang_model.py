@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
@@ -26,6 +27,9 @@ from sglang.srt.utils import add_prefix
 
 from sglang_omni.models.moss_transcribe_diarize.hf_config import (
     MossTranscribeDiarizeConfig,
+)
+from sglang_omni.models.moss_transcribe_diarize.encoder_cuda_graph import (
+    MossTranscribeDiarizeEncoderCudaGraphRunner,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,6 +76,10 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.whisper_encoder = WhisperEncoder(config.audio_config, quant_config)
+        self.encoder_cuda_graph_runner = None
+        if os.getenv("SGLANG_OMNI_MOSS_TD_ENCODER_CUDA_GRAPH", "1") != "0":
+            runner_cls = MossTranscribeDiarizeEncoderCudaGraphRunner
+            self.encoder_cuda_graph_runner = runner_cls(self.whisper_encoder)
         self.vq_adaptor = VQAdaptor(
             input_dim=config.adaptor_input_dim,
             hidden_size=config.text_config.hidden_size,
@@ -96,6 +104,27 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         trimmed_len = (seq_len // merge_size) * merge_size
         return features[:, :trimmed_len, :].reshape(
             batch_size, trimmed_len // merge_size, hidden_size * merge_size
+        )
+
+    def _run_whisper_encoder(
+        self,
+        input_features: torch.Tensor,
+        encoder_position_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        runner = self.encoder_cuda_graph_runner
+        if runner is not None:
+            graph_output = runner.encode(
+                input_features,
+                encoder_position_ids,
+                forward_batch,
+            )
+            if graph_output is not None:
+                return graph_output
+        return self.whisper_encoder(
+            input_features,
+            encoder_position_ids,
+            forward_batch,
         )
 
     def _encode_one_audio_item(
@@ -145,7 +174,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             device=input_features.device,
             dtype=torch.long,
         )
-        whisper_features = self.whisper_encoder(
+        whisper_features = self._run_whisper_encoder(
             input_features,
             encoder_position_ids,
             forward_batch,
