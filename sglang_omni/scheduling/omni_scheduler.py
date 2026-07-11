@@ -14,6 +14,7 @@ inheriting from ``SGLangScheduler``.
 from __future__ import annotations
 
 import logging
+import os
 import queue as _queue_mod
 import threading
 import time
@@ -52,6 +53,143 @@ _FAILED_BATCH_RESULT = object()
 
 _ABORTED_REQUEST_ID_LIMIT = 10000
 _ABORTED_REQUEST_ID_RETAINED = 5000
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return max(1, int(value))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, value, default)
+        return default
+
+
+class _DecodeLoopProfiler:
+    """Low-overhead aggregated timing for AR decode scheduler overhead."""
+
+    def __init__(self, *, enabled: bool, log_every: int) -> None:
+        self.enabled = enabled
+        self.log_every = max(1, int(log_every))
+        self._last_runner_async_query_hit = 0
+        self._last_runner_async_query_miss = 0
+        self.reset()
+
+    def reset(self) -> None:
+        self.steps = 0
+        self.decode_steps = 0
+        self.prefill_steps = 0
+        self.empty_steps = 0
+        self.sync_steps = 0
+        self.async_launch_steps = 0
+        self.async_resolve_steps = 0
+        self.async_query_hits = 0
+        self.async_query_misses = 0
+        self.total_batch_size = 0
+        self.total_finished_before_resolve = 0
+        self.total_trimmed_rows = 0
+        self.loop_ns = 0
+        self.get_batch_ns = 0
+        self.run_sync_ns = 0
+        self.launch_ns = 0
+        self.resolve_total_ns = 0
+        self.resolve_model_ns = 0
+        self.resolve_process_ns = 0
+        self.resolve_trim_ns = 0
+        self.process_result_ns = 0
+        self.stream_emit_ns = 0
+
+    def add_ns(self, name: str, delta_ns: int) -> None:
+        if self.enabled:
+            setattr(self, name, getattr(self, name) + int(delta_ns))
+
+    def add_step(self, *, batch: Any, loop_ns: int) -> None:
+        if not self.enabled:
+            return
+        self.steps += 1
+        self.loop_ns += int(loop_ns)
+        if batch is None:
+            self.empty_steps += 1
+            return
+        self.total_batch_size += len(batch.reqs)
+        if self._batch_is_decode(batch):
+            self.decode_steps += 1
+        else:
+            self.prefill_steps += 1
+
+    @staticmethod
+    def _batch_is_decode(batch: Any) -> bool:
+        mode = getattr(batch, "forward_mode", None)
+        if mode is None:
+            return False
+        if mode.is_decode():
+            return True
+        return not bool(mode.is_extend())
+
+    @staticmethod
+    def _ms(total_ns: int, denom: int) -> float:
+        return (float(total_ns) / 1_000_000.0 / float(max(1, denom)))
+
+    def maybe_log(self, scheduler: Any, reason: str = "periodic") -> None:
+        if not self.enabled or self.steps < self.log_every:
+            return
+        steps = self.steps
+        resolve_steps = max(1, self.async_resolve_steps)
+        avg_bs = self.total_batch_size / max(1, self.decode_steps + self.prefill_steps)
+        runner = getattr(scheduler, "_model_runner", None)
+        async_hits = self.async_query_hits
+        async_misses = self.async_query_misses
+        if runner is not None:
+            current_hits = int(getattr(runner, "_async_query_hit", 0))
+            current_misses = int(getattr(runner, "_async_query_miss", 0))
+            async_hits = max(0, current_hits - self._last_runner_async_query_hit)
+            async_misses = max(0, current_misses - self._last_runner_async_query_miss)
+            self._last_runner_async_query_hit = current_hits
+            self._last_runner_async_query_miss = current_misses
+        async_queries = async_hits + async_misses
+        async_hit_rate = async_hits / max(1, async_queries)
+        logger.info(
+            "decode_profile reason=%s steps=%d decode=%d prefill=%d empty=%d "
+            "avg_bs=%.2f sync=%d async_launch=%d async_resolve=%d "
+            "finished_before_resolve=%d trimmed_rows=%d async_query_hit_rate=%.3f "
+            "ms_per_step loop=%.3f get_batch=%.3f run_sync=%.3f launch=%.3f "
+            "process_result=%.3f stream_emit=%.3f "
+            "ms_per_resolve total=%.3f model=%.3f trim=%.3f process=%.3f",
+            reason,
+            steps,
+            self.decode_steps,
+            self.prefill_steps,
+            self.empty_steps,
+            avg_bs,
+            self.sync_steps,
+            self.async_launch_steps,
+            self.async_resolve_steps,
+            self.total_finished_before_resolve,
+            self.total_trimmed_rows,
+            async_hit_rate,
+            self._ms(self.loop_ns, steps),
+            self._ms(self.get_batch_ns, steps),
+            self._ms(self.run_sync_ns, max(1, self.sync_steps)),
+            self._ms(self.launch_ns, max(1, self.async_launch_steps)),
+            self._ms(
+                self.process_result_ns,
+                max(1, self.sync_steps + self.async_resolve_steps),
+            ),
+            self._ms(
+                self.stream_emit_ns,
+                max(1, self.sync_steps + self.async_resolve_steps),
+            ),
+            self._ms(self.resolve_total_ns, resolve_steps),
+            self._ms(self.resolve_model_ns, resolve_steps),
+            self._ms(self.resolve_trim_ns, resolve_steps),
+            self._ms(self.resolve_process_ns, resolve_steps),
+        )
+        self.reset()
 
 
 class _NoOpSender:
@@ -298,6 +436,14 @@ class OmniScheduler:
         self.enable_pdmux = False
         self.enable_metrics = server_args.enable_metrics
         self.enable_trace = False
+        self._decode_profiler = (
+            _DecodeLoopProfiler(
+                enabled=True,
+                log_every=_env_int("SGLANG_OMNI_DECODE_PROFILE_EVERY", 200),
+            )
+            if _env_flag("SGLANG_OMNI_DECODE_PROFILE")
+            else None
+        )
         self.enable_hierarchical_cache = False
         self.enable_hicache_storage = False
         self.enable_kv_cache_events = False
@@ -831,6 +977,8 @@ class OmniScheduler:
         a ``GenerationBatchResult``.  We bridge the two formats here.
         """
         self._emit_prefill_start_for_batch(batch)
+        profiler = getattr(self, "_decode_profiler", None)
+        profile_start_ns = time.perf_counter_ns() if profiler is not None else 0
         if self._model_runner is not None:
             # Mirror upstream run_batch's per-forward counter: OmniScheduler
             # overrides run_batch, so without this forward_ct stays 0 and
@@ -840,9 +988,16 @@ class OmniScheduler:
             sched_output = self._build_sched_output(batch)
             mr_output = self._model_runner.execute(sched_output)
             self._emit_stream_output(sched_output, mr_output)
+            if profiler is not None:
+                profiler.sync_steps += 1
+                profiler.add_ns("run_sync_ns", time.perf_counter_ns() - profile_start_ns)
             return self._make_batch_result(batch, mr_output)
         # Fallback: call upstream's run_batch (uses tp_worker directly)
-        return _Upstream.run_batch(self, batch, pp_proxy_tensors)
+        result = _Upstream.run_batch(self, batch, pp_proxy_tensors)
+        if profiler is not None:
+            profiler.sync_steps += 1
+            profiler.add_ns("run_sync_ns", time.perf_counter_ns() - profile_start_ns)
+        return result
 
     def _build_sched_output(self, batch):
         """Wrap a ScheduleBatch into the SchedulerOutput the model runner
@@ -862,7 +1017,11 @@ class OmniScheduler:
         overrun) — emitting their extra chunk would corrupt the downstream
         vocoder's delayed-code stream. Aborted requests are suppressed for the
         same reason: an abort landing mid-step must not ship one more chunk."""
+        profiler = getattr(self, "_decode_profiler", None)
+        profile_start_ns = time.perf_counter_ns() if profiler is not None else 0
         if self._stream_output_builder is None:
+            if profiler is not None:
+                profiler.add_ns("stream_emit_ns", time.perf_counter_ns() - profile_start_ns)
             return
         for sched_req in sched_output.requests:
             rid = sched_req.request_id
@@ -881,6 +1040,8 @@ class OmniScheduler:
                         )
                     emitted_any = True
                 self.outbox.put(msg)
+        if profiler is not None:
+            profiler.add_ns("stream_emit_ns", time.perf_counter_ns() - profile_start_ns)
 
     @staticmethod
     def _make_batch_result(batch, mr_output):
@@ -906,8 +1067,13 @@ class OmniScheduler:
         # One forward per launch; mirror upstream run_batch's per-forward
         # counter (the matching resolve does no forward, so it must not count).
         self.forward_ct = getattr(self, "forward_ct", 0) + 1
+        profiler = getattr(self, "_decode_profiler", None)
+        profile_start_ns = time.perf_counter_ns() if profiler is not None else 0
         sched_output = self._build_sched_output(batch)
         pending_step = self._model_runner.execute_launch(sched_output)
+        if profiler is not None:
+            profiler.async_launch_steps += 1
+            profiler.add_ns("launch_ns", time.perf_counter_ns() - profile_start_ns)
         return sched_output, pending_step
 
     def _run_batch_resolve(self, batch, sched_output, pending_step, skip_rids=()):
@@ -921,7 +1087,11 @@ class OmniScheduler:
         """
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
+        profiler = getattr(self, "_decode_profiler", None)
+        profile_start_ns = time.perf_counter_ns() if profiler is not None else 0
         mr_output = self._model_runner.execute_resolve(pending_step)
+        if profiler is not None:
+            profiler.add_ns("resolve_model_ns", time.perf_counter_ns() - profile_start_ns)
         if mr_output is None:
             return _FAILED_BATCH_RESULT
         self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
@@ -1608,6 +1778,8 @@ class OmniScheduler:
         # (which is mostly Python-side dispatch into many small CUDA kernels)
         # slows ~600x, dropping audio QPS from >10 to <0.5.
         while self._running:
+            profiler = getattr(self, "_decode_profiler", None)
+            loop_start_ns = time.perf_counter_ns() if profiler is not None else 0
             self._process_admin_requests()
             recv_reqs = self.recv_requests()
             recv_reqs.extend(self._take_deferred_request_payloads())
@@ -1617,13 +1789,24 @@ class OmniScheduler:
                 time.sleep(0.001)
                 continue
 
+            get_batch_start_ns = time.perf_counter_ns() if profiler is not None else 0
             batch = self.get_next_batch_to_run()
+            if profiler is not None:
+                profiler.add_ns(
+                    "get_batch_ns", time.perf_counter_ns() - get_batch_start_ns
+                )
             self.cur_batch = batch
 
             if batch:
                 result = self.run_batch(batch)
                 if result is not _FAILED_BATCH_RESULT:
+                    process_start_ns = time.perf_counter_ns() if profiler is not None else 0
                     self.process_batch_result(batch, result)
+                    if profiler is not None:
+                        profiler.add_ns(
+                            "process_result_ns",
+                            time.perf_counter_ns() - process_start_ns,
+                        )
             else:
                 self.self_check_during_idle()
                 time.sleep(0.001)
@@ -1631,6 +1814,11 @@ class OmniScheduler:
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+            if profiler is not None:
+                profiler.add_step(
+                    batch=batch, loop_ns=time.perf_counter_ns() - loop_start_ns
+                )
+                profiler.maybe_log(self)
 
     def _event_loop_overlap(self) -> None:
         self.result_queue = deque()
@@ -1640,6 +1828,8 @@ class OmniScheduler:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while self._running:
+            profiler = getattr(self, "_decode_profiler", None)
+            loop_start_ns = time.perf_counter_ns() if profiler is not None else 0
             self._process_admin_requests()
             recv_reqs = self.recv_requests()
             recv_reqs.extend(self._take_deferred_request_payloads())
@@ -1649,7 +1839,12 @@ class OmniScheduler:
                 time.sleep(0.001)
                 continue
 
+            get_batch_start_ns = time.perf_counter_ns() if profiler is not None else 0
             batch = self.get_next_batch_to_run()
+            if profiler is not None:
+                profiler.add_ns(
+                    "get_batch_ns", time.perf_counter_ns() - get_batch_start_ns
+                )
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
@@ -1678,6 +1873,11 @@ class OmniScheduler:
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+            if profiler is not None:
+                profiler.add_step(
+                    batch=batch, loop_ns=time.perf_counter_ns() - loop_start_ns
+                )
+                profiler.maybe_log(self)
 
     @staticmethod
     def _batch_is_decode(batch: ScheduleBatch) -> bool:
@@ -1713,6 +1913,8 @@ class OmniScheduler:
         _mark_sampler_finished sets) must be KEPT so process_batch_result emits
         it — only reqs finished in a *prior* step are the overrun to drop.
         """
+        profiler = getattr(self, "_decode_profiler", None)
+        resolve_total_start_ns = time.perf_counter_ns() if profiler is not None else 0
         # A request retracted at step S is still in step S+1's lagged batch;
         # drop it like a prior-step finish so its KV is not re-freed.
         pre_finished = [
@@ -1725,7 +1927,9 @@ class OmniScheduler:
         )
         if result is _FAILED_BATCH_RESULT:
             return
+        trim_start_ns = time.perf_counter_ns() if profiler is not None else 0
         keep = [i for i, was_finished in enumerate(pre_finished) if not was_finished]
+        trimmed_rows = len(batch.reqs) - len(keep)
         if len(keep) < len(batch.reqs):
             if result.next_token_ids is not None and keep:
                 idx = torch.tensor(keep, device=result.next_token_ids.device)
@@ -1736,8 +1940,20 @@ class OmniScheduler:
             # zips batch.reqs with next_token_ids and uses Req attributes (not
             # positional batch tensors), so trimming reqs in lockstep suffices.
             batch.reqs = [batch.reqs[i] for i in keep]
+        if profiler is not None:
+            profiler.async_resolve_steps += 1
+            profiler.total_finished_before_resolve += len(skip_rids)
+            profiler.total_trimmed_rows += trimmed_rows
+            profiler.add_ns("resolve_trim_ns", time.perf_counter_ns() - trim_start_ns)
         if batch.reqs:
+            process_start_ns = time.perf_counter_ns() if profiler is not None else 0
             self.process_batch_result(batch, result)
+            if profiler is not None:
+                process_ns = time.perf_counter_ns() - process_start_ns
+                profiler.add_ns("process_result_ns", process_ns)
+                profiler.add_ns("resolve_process_ns", process_ns)
+        if profiler is not None:
+            profiler.add_ns("resolve_total_ns", time.perf_counter_ns() - resolve_total_start_ns)
 
     def _resolve_pending_async(self) -> None:
         """Resolve + process the in-flight decode step, if any. Used to flush
@@ -1809,6 +2025,8 @@ class OmniScheduler:
         decode first and run synchronously (the in-flight step is never stranded).
         """
         while self._running:
+            profiler = getattr(self, "_decode_profiler", None)
+            loop_start_ns = time.perf_counter_ns() if profiler is not None else 0
             self._process_admin_requests()
             recv_reqs = self.recv_requests()
             recv_reqs.extend(self._take_deferred_request_payloads())
@@ -1829,7 +2047,12 @@ class OmniScheduler:
             ):
                 self._resolve_pending_async()
 
+            get_batch_start_ns = time.perf_counter_ns() if profiler is not None else 0
             batch = self.get_next_batch_to_run()
+            if profiler is not None:
+                profiler.add_ns(
+                    "get_batch_ns", time.perf_counter_ns() - get_batch_start_ns
+                )
             self.cur_batch = batch
 
             # Route through sync when the runner's collect has a sync-only
@@ -1877,7 +2100,15 @@ class OmniScheduler:
                 if batch:
                     result = self.run_batch(batch)
                     if result is not _FAILED_BATCH_RESULT:
+                        process_start_ns = (
+                            time.perf_counter_ns() if profiler is not None else 0
+                        )
                         self.process_batch_result(batch, result)
+                        if profiler is not None:
+                            profiler.add_ns(
+                                "process_result_ns",
+                                time.perf_counter_ns() - process_start_ns,
+                            )
                 else:
                     self.self_check_during_idle()
                     time.sleep(0.001)
@@ -1885,6 +2116,11 @@ class OmniScheduler:
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+            if profiler is not None:
+                profiler.add_step(
+                    batch=batch, loop_ns=time.perf_counter_ns() - loop_start_ns
+                )
+                profiler.maybe_log(self)
 
     def _drain_inbox_for_request(self, request_id: str) -> None:
         retained: list[IncomingMessage] = []
