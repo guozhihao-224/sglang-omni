@@ -546,7 +546,19 @@ class HiggsTTSModel(nn.Module):
         optionally the untied modality head). Text-backbone loading delegates
         to :meth:`Qwen3ForCausalLM.load_weights`, which does qkv / gate_up
         stacking and lm_head tying internally.
+
+        When weight IPC follower mode is active, checkpoint materialization is
+        skipped; ``SGLModelRunner.load_model`` aliases leader storages before
+        KV profiling.
         """
+        from sglang_omni.distributed.weight_ipc.config import is_weight_ipc_follower
+
+        if is_weight_ipc_follower():
+            # Consume the iterator so the loader does not warn about unread weights.
+            for _name, _tensor in weights:
+                pass
+            return set()
+
         mapper = DiscreteWeightMapper(
             text_prefix_map=_BACKBONE_PREFIX_MAP,
             tie_modality=self._tie_modality,

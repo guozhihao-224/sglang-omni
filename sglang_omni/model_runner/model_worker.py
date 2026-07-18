@@ -26,6 +26,7 @@ class ModelWorkerConfig:
     weight_prefix: str | None = None
     nccl_port: int | None = None
     total_gpu_memory_fraction: float | None = None
+    weight_ipc: Any | None = None
 
 
 _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
@@ -53,6 +54,7 @@ class ModelWorker:
         self.weight_prefix = config.weight_prefix
         self.nccl_port = config.nccl_port
         self.total_gpu_memory_fraction = config.total_gpu_memory_fraction
+        self.weight_ipc = config.weight_ipc
 
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
@@ -196,6 +198,7 @@ class ModelWorker:
             model_arch_override=self.model_arch_override,
             weight_prefix=self.weight_prefix,
             total_gpu_memory_fraction=self.total_gpu_memory_fraction,
+            weight_ipc=self.weight_ipc,
         )
 
     def _init_dllm_algorithm(self):
