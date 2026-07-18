@@ -18,6 +18,8 @@
 #   NUMA_NODE: explicit override when the PCI-derived NUMA node is unavailable.
 #   MAX_TOTAL_TOKENS: common positive --max-total-tokens cap; required for N > 1.
 #   MF: optional explicit --mem-fraction-static override (unset = Higgs default).
+#   WEIGHT_IPC: 0|1 (default 0). When 1, replica 0 exports AR weights via CUDA IPC
+#     and replicas 1..N-1 alias them (see docs/design/weight_ipc_same_gpu_dp.md).
 set -euo pipefail
 
 STATE_ROOT=${STATE_ROOT:-/tmp/sglang-omni-same-gpu-dp/$UID}
@@ -225,13 +227,14 @@ teardown_state() {
   # Note (jiaxin): these GPUs are shared; teardown only signals processes recorded
   # in this run's state, never scans the whole GPU, and keeps the state directory
   # whenever cleanup cannot be confirmed, so nothing is hidden from inspection.
+  # Stop highest replica index first so weight-IPC followers unmap before leader.
   local state=$1 keep=${2:-} leader_pid pgid leader_start t live raw control_pid=""
   [ -n "$state" ] && [ -f "$state/replicas.tsv" ] || die "invalid or missing run state '$state'"
   control_pid=$(mps_control_pid "$state" || true)
   while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
     leader_identity_matches "$leader_pid" "$leader_start" || continue
     kill -TERM -- "-$pgid" 2>/dev/null || true
-  done < "$state/replicas.tsv"
+  done < <(tac "$state/replicas.tsv")
   for ((t=1; t<=DRAIN_TRIES; t++)); do
     live=$(tracked_pids "$state")
     [ -z "${live// /}" ] && break
@@ -278,7 +281,7 @@ teardown_state() {
     while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
       leader_identity_matches "$leader_pid" "$leader_start" || continue
       kill -KILL -- "-$pgid" 2>/dev/null || true
-    done < "$state/replicas.tsv"
+    done < <(tac "$state/replicas.tsv")
     sleep 2
   fi
   live=$(tracked_pids "$state")
@@ -356,12 +359,19 @@ up() {
   trap cleanup_failed_startup EXIT
 
   chmod 700 "$state/mps" "$state/mps/pipe" "$state/mps/log"
+  local weight_ipc=${WEIGHT_IPC:-0}
+  [[ "$weight_ipc" =~ ^[01]$ ]] || die "WEIGHT_IPC must be 0 or 1, got '$weight_ipc'"
+  if [ "$weight_ipc" = 1 ]; then
+    mkdir -p "$state/weight_ipc"
+    chmod 700 "$state/weight_ipc"
+  fi
   {
     echo "run_id=$run"; echo "gpu_id=$gpu"; echo "gpu_uuid=$uuid"; echo "numa_node=$node"
     echo "model=$model"; echo "model_name=$model_name"; echo "n=$n"
     echo "mem_fraction_static=${mf:-default}"
     echo "base_port=$base_port"; echo "core_blocks=$CORE_BLOCKS"
     echo "max_total_tokens=${MAX_TOTAL_TOKENS:-auto/profiled}"
+    echo "weight_ipc=$weight_ipc"
   } > "$state/manifest"
 
   export CUDA_MPS_PIPE_DIRECTORY=$state/mps/pipe CUDA_MPS_LOG_DIRECTORY=$state/mps/log
@@ -387,10 +397,20 @@ up() {
   pid_is_live "$control_pid" \
     || die "MPS control daemon PID $control_pid exited during startup"
 
-  local pid leader_start log resolved_tokens
+  local pid leader_start log resolved_tokens weight_ipc_args=()
   for ((i=0; i<n; i++)); do
     port=$((base_port+i))
     log=$state/logs/replica_$i.log
+    weight_ipc_args=()
+    if [ "$weight_ipc" = 1 ]; then
+      if [ "$i" -eq 0 ]; then
+        weight_ipc_args=(--weight-ipc-role leader --weight-ipc-store "$state/weight_ipc")
+      else
+        weight_ipc_args=(--weight-ipc-role follower --weight-ipc-store "$state/weight_ipc")
+        [ -f "$state/weight_ipc/READY" ] \
+          || die "WEIGHT_IPC=1 but leader did not create $state/weight_ipc/READY before follower $i"
+      fi
+    fi
     # Note (jiaxin): concurrent colocated launches raced on CUDA-graph capture and
     # memory profiling in testing, so replicas start sequentially behind a health
     # gate; setsid gives each replica its own process group so teardown can signal
@@ -398,7 +418,7 @@ up() {
     CUDA_VISIBLE_DEVICES="$uuid" \
     setsid numactl --cpunodebind="$node" --membind="$node" -C "${blocks[$i]}" \
       sgl-omni serve --model-path "$model" --model-name "$model_name" \
-        "${mem_args[@]}" "${extra_args[@]}" \
+        "${mem_args[@]}" "${extra_args[@]}" "${weight_ipc_args[@]}" \
         --host 127.0.0.1 --port "$port" > "$log" 2>&1 < /dev/null &
     pid=$!
     leader_start=$(pid_start_time "$pid") \
@@ -420,6 +440,11 @@ up() {
       echo "replica $i health timeout after $((HEALTH_TRIES*HEALTH_INTERVAL))s; last log lines:" >&2
       tail -n 8 "$log" >&2
       exit 1
+    fi
+    if [ "$weight_ipc" = 1 ] && [ "$i" -eq 0 ]; then
+      [ -f "$state/weight_ipc/READY" ] \
+        || die "leader is healthy but weight IPC READY is missing at $state/weight_ipc/READY"
+      echo "weight_ipc: READY (leader exported)"
     fi
     echo "replica $i healthy on port $port (cores ${blocks[$i]}, mem fraction ${mf:-default})"
     resolved_tokens=""

@@ -157,6 +157,26 @@ nsys profile --gpu-metrics-devices $GPU_ID --gpu-metrics-set gh100 \
 
 Low SM activity at the tuned single replica's peak may indicate reclaimable headroom; confirm it with a controlled DP comparison before relying on it. If SM activity is already near the ceiling, stop here.
 
+## Optional: share AR weights across same-GPU replicas (CUDA IPC)
+
+By default each replica loads its own AR weights. On H100 Higgs that costs about 7.6 GB per replica and can prevent DP4 from keeping Equal KV at `MAX_TOTAL_TOKENS=100000`. Setting `WEIGHT_IPC=1` makes replica 0 export AR parameters over CUDA IPC and replicas 1…N-1 alias them (see [`docs/design/weight_ipc_same_gpu_dp.md`](../design/weight_ipc_same_gpu_dp.md)).
+
+```bash
+# DP4 shared weights + Equal KV 100k
+WEIGHT_IPC=1 N=4 GPU_ID=0 MAX_TOTAL_TOKENS=100000 \
+  CORE_BLOCKS="0-7 8-15 16-23 24-31" \
+  bash examples/mps_dp/launch.sh up
+```
+
+Helpers for correctness and Phase-3 style speed checks:
+
+```bash
+bash examples/weight_ipc/run_h100_go_nogo.sh dp2-parity
+bash examples/weight_ipc/run_phase3_perf.sh   # needs CORE_BLOCKS_DP3 / CORE_BLOCKS_DP4
+```
+
+A single H100 Higgs snapshot (SeedTTS EN generate-only, one client per replica, `c=64`, streaming) measured DP3 shared aggregate QPS slightly **above** DP3 unshared (no sharing tax), DP4 shared peak above DP3 shared, and card memory for DP4 shared around 70–71 GB. Matched offered-load TTFC for DP4 vs DP3 was mixed; re-measure on your host before treating TTFC as a product win. Default remains `WEIGHT_IPC=0`.
+
 ## Limits and next steps
 
 1. **Generality is not fully validated.** Beyond the pinned H100 Higgs case study, we also ran related experiments on H200 and used SGLang to serve Qwen3-4B directly; both lines of work largely confirmed the same-GPU DP gains. Space and time limit how completely we can present those results here, and the measurements are not yet as polished as we would like. We believe same-GPU DP is a promising direction for smaller models on GPUs with ample memory and compute headroom, but the experimental coverage is still incomplete.
