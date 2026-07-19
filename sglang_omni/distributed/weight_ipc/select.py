@@ -9,7 +9,8 @@ import torch
 
 
 class SharePolicy(Protocol):
-    def select(self, model: torch.nn.Module) -> list[tuple[str, torch.Tensor]]: ...
+    def select(self, model: torch.nn.Module) -> list[tuple[str, torch.Tensor]]:
+        pass
 
 
 class ArParametersPolicy:
