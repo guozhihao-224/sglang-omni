@@ -29,6 +29,29 @@ from .tool_funcs.audio_lengths import fun_asr_low_frame_rate_length
 
 logger = logging.getLogger(__name__)
 
+# HF Fun-ASR-Nano checkpoints store SANM Q/K/V as separate linears; runtime uses
+# a single fused qkv_proj (FunASR linear_q_k_v). Shard order is Q, K, V along dim0.
+_SANM_QKV_SHARD_IDS = {
+    "q_proj": 0,
+    "k_proj": 1,
+    "v_proj": 2,
+}
+
+
+def _load_sanm_qkv_shard(
+    param: torch.nn.Parameter, loaded_weight: torch.Tensor, shard_id: int
+) -> None:
+    shard_size = param.shape[0] // 3
+    start = shard_id * shard_size
+    end = start + shard_size
+    param_slice = param.data[start:end]
+    if param_slice.shape != loaded_weight.shape:
+        raise ValueError(
+            f"SANM qkv shard {shard_id} shape mismatch: "
+            f"param slice {tuple(param_slice.shape)} vs loaded {tuple(loaded_weight.shape)}"
+        )
+    param_slice.copy_(loaded_weight)
+
 
 class SinusoidalPositionEncoder(nn.Module):
 
@@ -46,6 +69,11 @@ class SinusoidalPositionEncoder(nn.Module):
 
 
 class MultiHeadedAttentionSANM(nn.Module):
+    """SANM attention with fused QKV, matching FunASR ``linear_q_k_v``.
+
+    Returns ``(attn_out, v)`` so the Encoder layer can reuse the same V for FSMN
+    without a second ``v_proj``.
+    """
 
     def __init__(
         self,
@@ -58,17 +86,15 @@ class MultiHeadedAttentionSANM(nn.Module):
         assert n_feat % n_head == 0
         self.d_k = n_feat // n_head
         self.h = n_head
-        self.q_proj = nn.Linear(in_feat, n_feat)
-        self.k_proj = nn.Linear(in_feat, n_feat)
-        self.v_proj = nn.Linear(in_feat, n_feat)
+        self.n_feat = n_feat
+        self.qkv_proj = nn.Linear(in_feat, n_feat * 3)
         self.out_proj = nn.Linear(n_feat, n_feat)
         self.dropout = nn.Dropout(p=dropout_rate)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         b, t, _ = x.size()
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split(self.n_feat, dim=-1)
         q_h = q.view(b, t, self.h, self.d_k).transpose(1, 2)  # (b, h, t, dk)
         k_h = k.view(b, t, self.h, self.d_k).transpose(1, 2)
         v_h = v.view(b, t, self.h, self.d_k).transpose(1, 2)
@@ -77,9 +103,9 @@ class MultiHeadedAttentionSANM(nn.Module):
         scores = torch.matmul(q_h, k_h.transpose(-2, -1))  # (b, h, t, t)
         attn = torch.softmax(scores, dim=-1)
         p_attn = self.dropout(attn)
-        x = torch.matmul(p_attn, v_h)  # (b, h, t, dk)
-        x = x.transpose(1, 2).contiguous().view(b, -1, self.h * self.d_k)
-        return self.out_proj(x)
+        out = torch.matmul(p_attn, v_h)  # (b, h, t, dk)
+        out = out.transpose(1, 2).contiguous().view(b, -1, self.h * self.d_k)
+        return self.out_proj(out), v
 
 
 class FunAsrNanoFSMN(nn.Module):
@@ -138,8 +164,8 @@ class EncoderLayerSANM(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.self_attn_layer_norm(x)
-        value_states = self.self_attn.v_proj(x)
-        x = self.dropout(self.self_attn(x) + self.fsmn(value_states))
+        attn_out, value_states = self.self_attn(x)
+        x = self.dropout(attn_out + self.fsmn(value_states))
         if self.in_size == self.size:
             x = residual + x
         residual = x
@@ -323,7 +349,9 @@ class FunAsrNanoForConditionalGeneration(nn.Module):
         ".q_proj.",
         ".k_proj.",
         ".v_proj.",
+        ".qkv_proj.",
         ".o_proj.",
+        ".out_proj.",
     ]
     bitsandbytes_stacked_params_mapping = {
         "q_proj": ("qkv_proj", 0),
@@ -473,6 +501,26 @@ class FunAsrNanoForConditionalGeneration(nn.Module):
                     param = params_dict[name_tmp]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
+                    stacked = True
+                    break
+                if stacked:
+                    continue
+
+            # Audio SANM: HF separate q/k/v_proj → fused self_attn.qkv_proj.
+            if name.startswith("audio_tower.") and ".self_attn." in name:
+                stacked = False
+                for weight_name, shard_id in _SANM_QKV_SHARD_IDS.items():
+                    needle = f".self_attn.{weight_name}."
+                    if needle not in name:
+                        continue
+                    name_tmp = name.replace(
+                        f".self_attn.{weight_name}.", ".self_attn.qkv_proj."
+                    )
+                    if name_tmp not in params_dict:
+                        continue
+                    _load_sanm_qkv_shard(
+                        params_dict[name_tmp], loaded_weight, shard_id
+                    )
                     stacked = True
                     break
                 if stacked:
