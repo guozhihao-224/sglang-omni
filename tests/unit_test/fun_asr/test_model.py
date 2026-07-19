@@ -13,6 +13,7 @@ from sglang_omni.models.fun_asr.sglang_model import (
     FunAsrNanoAdaptor,
     FunAsrNanoAudioEncoder,
     FunAsrNanoForConditionalGeneration,
+    MultiHeadedAttention,
     MultiHeadedAttentionSANM,
 )
 
@@ -163,14 +164,35 @@ def test_sanm_attention_shares_v_with_fsmn_path() -> None:
 
     assert torch.allclose(v_shared, v, atol=1e-5, rtol=1e-5)
     b, t, _ = x_norm.size()
-    q_h = q.view(b, t, 2, 4).transpose(1, 2) * (4**-0.5)
+    q_h = q.view(b, t, 2, 4).transpose(1, 2)
     k_h = k.view(b, t, 2, 4).transpose(1, 2)
     v_h = v.view(b, t, 2, 4).transpose(1, 2)
-    scores = torch.matmul(q_h, k_h.transpose(-2, -1))
-    ref_attn = torch.matmul(torch.softmax(scores, dim=-1), v_h)
+    ref_attn = torch.nn.functional.scaled_dot_product_attention(
+        q_h, k_h, v_h, dropout_p=0.0, is_causal=False
+    )
     ref_attn = ref_attn.transpose(1, 2).contiguous().view(b, t, 8)
     ref_attn = layer.self_attn.out_proj(ref_attn)
     assert torch.allclose(attn_out, ref_attn, atol=1e-5, rtol=1e-5)
 
     out = layer(x)
     assert out.shape == x.shape
+
+
+def test_adaptor_attention_uses_sdpa() -> None:
+    torch.manual_seed(0)
+    attn = MultiHeadedAttention(n_head=2, n_feat=8, dropout_rate=0.0)
+    attn.eval()
+    x = torch.randn(2, 5, 8)
+
+    with torch.no_grad():
+        out = attn(x)
+        q_h = attn.q_proj(x).view(2, 5, 2, 4).transpose(1, 2)
+        k_h = attn.k_proj(x).view(2, 5, 2, 4).transpose(1, 2)
+        v_h = attn.v_proj(x).view(2, 5, 2, 4).transpose(1, 2)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q_h, k_h, v_h, dropout_p=0.0, is_causal=False
+        )
+        ref = attn.out_proj(ref.transpose(1, 2).contiguous().view(2, 5, 8))
+
+    assert out.shape == x.shape
+    assert torch.allclose(out, ref, atol=1e-5, rtol=1e-5)

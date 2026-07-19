@@ -8,6 +8,7 @@ from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -72,7 +73,8 @@ class MultiHeadedAttentionSANM(nn.Module):
     """SANM attention with fused QKV, matching FunASR ``linear_q_k_v``.
 
     Returns ``(attn_out, v)`` so the Encoder layer can reuse the same V for FSMN
-    without a second ``v_proj``.
+    without a second ``v_proj``. Attention uses SDPA so PyTorch can pick a fused
+    backend and avoid materializing the full score/softmax tensors.
     """
 
     def __init__(
@@ -87,9 +89,9 @@ class MultiHeadedAttentionSANM(nn.Module):
         self.d_k = n_feat // n_head
         self.h = n_head
         self.n_feat = n_feat
+        self.attn_dropout = dropout_rate
         self.qkv_proj = nn.Linear(in_feat, n_feat * 3)
         self.out_proj = nn.Linear(n_feat, n_feat)
-        self.dropout = nn.Dropout(p=dropout_rate)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         b, t, _ = x.size()
@@ -99,11 +101,13 @@ class MultiHeadedAttentionSANM(nn.Module):
         k_h = k.view(b, t, self.h, self.d_k).transpose(1, 2)
         v_h = v.view(b, t, self.h, self.d_k).transpose(1, 2)
 
-        q_h = q_h * (self.d_k**-0.5)
-        scores = torch.matmul(q_h, k_h.transpose(-2, -1))  # (b, h, t, t)
-        attn = torch.softmax(scores, dim=-1)
-        p_attn = self.dropout(attn)
-        out = torch.matmul(p_attn, v_h)  # (b, h, t, dk)
+        out = F.scaled_dot_product_attention(
+            q_h,
+            k_h,
+            v_h,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=False,
+        )
         out = out.transpose(1, 2).contiguous().view(b, -1, self.h * self.d_k)
         return self.out_proj(out), v
 
@@ -249,24 +253,26 @@ class MultiHeadedAttention(nn.Module):
         assert n_feat % n_head == 0
         self.d_k = n_feat // n_head
         self.h = n_head
+        self.attn_dropout = dropout_rate
         self.q_proj = nn.Linear(n_feat, n_feat)
         self.k_proj = nn.Linear(n_feat, n_feat)
         self.v_proj = nn.Linear(n_feat, n_feat)
         self.out_proj = nn.Linear(n_feat, n_feat)
-        self.dropout = nn.Dropout(p=dropout_rate)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, t, d = x.size()
+        b, t, _ = x.size()
         q_h = self.q_proj(x).view(b, t, self.h, self.d_k).transpose(1, 2)
         k_h = self.k_proj(x).view(b, t, self.h, self.d_k).transpose(1, 2)
         v_h = self.v_proj(x).view(b, t, self.h, self.d_k).transpose(1, 2)
-        q_h = q_h * (self.d_k**-0.5)
-        scores = torch.matmul(q_h, k_h.transpose(-2, -1))
-        attn = torch.softmax(scores, dim=-1)
-        p_attn = self.dropout(attn)
-        x = torch.matmul(p_attn, v_h)
-        x = x.transpose(1, 2).contiguous().view(b, -1, self.h * self.d_k)
-        return self.out_proj(x)
+        out = F.scaled_dot_product_attention(
+            q_h,
+            k_h,
+            v_h,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        out = out.transpose(1, 2).contiguous().view(b, -1, self.h * self.d_k)
+        return self.out_proj(out)
 
 
 class AdaptorEncoderLayer(nn.Module):
